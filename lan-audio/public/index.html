@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LAN Audio Relay v2</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="eyebrow">Same Wi-Fi Audio Relay</div>
+        <h1>Send your PC sound to your phone v2.</h1>
+        <p class="lead">
+          Open the host page on the PC in Chrome or Edge, route audio into VB-CABLE, and then open the listener page on your phone.
+        </p>
+        <div class="button-row">
+          <a class="button" href="/host">Open PC Host</a>
+          <a class="button secondary" href="/listen">Open Phone Listener</a>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>How it works</h2>
+        <div class="steps">
+          <p>1. Run <code>npm run lan-audio</code> on this PC.</p>
+          <p>2. On the PC, open <code>http://localhost:43117/host</code>.</p>
+          <p>3. Route the app audio you want into <code>CABLE Input</code>, then open one of the listener URLs shown below on the phone.</p>
+        </div>
+        <div class="links" id="listen-links"></div>
+      </section>
+    </main>
+
+    <script src="/common.js"></script>
+    <script>
+      const links = document.querySelector('#listen-links')
+
+      fetchStatus()
+        .then(status => {
+          if (!status.listenPages.length) {
+            links.innerHTML = '<p class="small">No LAN IP detected yet. Check that the PC is connected to Wi-Fi.</p>'
+            return
+          }
+
+          links.innerHTML = status.listenPages
+            .map(url => `<div class="codebox">${url}</div>`)
+            .join('')
+        })
+        .catch(error => {
+          links.innerHTML = `<p class="small">${error.message}</p>`
+        })
+    </script>
+  </body>
+</html>

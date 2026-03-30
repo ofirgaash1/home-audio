@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Host PC Audio v2</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="eyebrow">PC Host</div>
+        <h1>Broadcast VB-CABLE audio from this PC v2.</h1>
+        <p class="lead">
+          Use this page on the PC only. Route Windows audio into <code>CABLE Input</code>, capture <code>CABLE Output</code> here, and send a separately delayed monitor back to your speakers.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <p class="small">Source Device (probably CABLE OUTPUT)</p>
+            <div class="button-row" style="margin-top: 10px;">
+              <select id="source-device"></select>
+              <button id="refresh-devices" type="button" class="secondary">Refresh Devices</button>
+            </div>
+          </div>
+          <div class="card">
+            <p class="small">Local Monitor Output (probably realtek / soundcard)</p>
+            <div class="button-row" style="margin-top: 10px;">
+              <select id="monitor-device"></select>
+            </div>
+            <p class="small" style="margin-top: 12px;">Delay: <span id="monitor-delay-value">250 ms</span></p>
+            <input id="monitor-delay" type="range" min="0" max="1500" step="10" value="250" style="width: 100%; margin-top: 10px;">
+            <div class="button-row preset-row" style="margin-top: 12px;">
+              <button type="button" class="secondary preset-button" data-delay="100">Phone (100 ms)</button>
+              <button type="button" class="secondary preset-button" data-delay="110">Sony WF-1000XM5 (110 ms)</button>
+              <button type="button" class="secondary preset-button" data-delay="210">JBL Flip 5 (210 ms)</button>
+            </div>
+          </div>
+        </div>
+        <div class="button-row">
+          <button id="start">Start Broadcast</button>
+          <button id="stop" class="secondary" disabled>Stop</button>
+        </div>
+        <div class="status" id="status">Waiting to start.</div>
+        <audio id="monitor-player" autoplay playsinline hidden></audio>
+      </section>
+
+      <section class="panel">
+        <h2>Signal View</h2>
+        <p class="small">Use these meters to confirm that the host is seeing source audio and producing delayed monitor audio.</p>
+        <div class="meter-grid">
+          <div class="meter-card">
+            <div class="meter-heading">
+              <span>Source Input</span>
+              <span class="small" id="source-meter-value">Waiting for audio</span>
+            </div>
+            <canvas id="source-meter" class="meter-canvas"></canvas>
+          </div>
+          <div class="meter-card">
+            <div class="meter-heading">
+              <span>Monitor Output</span>
+              <span class="small" id="monitor-meter-value">Waiting for audio</span>
+            </div>
+            <canvas id="monitor-meter" class="meter-canvas"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Phone URL</h2>
+        <p class="small">Open one of these on your phone while it is on the same Wi-Fi.</p>
+        <div class="links" id="listen-links"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Participants</h2>
+        <p class="small">Everyone can change every participant's delay and channel mode. Delay changes apply only to that participant's local playback path.</p>
+        <div class="table-wrap">
+          <table class="participant-table">
+            <thead>
+              <tr>
+                <th>Participant</th>
+                <th>Role</th>
+                <th>Delay</th>
+                <th>Channel</th>
+              </tr>
+            </thead>
+            <tbody id="participants-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Host Diagnostics</h2>
+        <p class="small">Use this to verify that the host has a live capture track and that each peer actually has an audio sender.</p>
+        <pre class="codebox diagnostics-box" id="diagnostics">Loading diagnostics...</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Phone Diagnostics</h2>
+        <p class="small">This mirrors the latest diagnostics snapshot reported by connected listeners.</p>
+        <pre class="codebox diagnostics-box" id="listener-diagnostics">Waiting for phone diagnostics...</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Routing</h2>
+        <p class="small">
+          1. Keep Windows default playback on your real speakers or headphones, such as <code>AudioBox USB 96</code>.
+        </p>
+        <p class="small" style="margin-top: 10px;">
+          2. In Windows Volume Mixer, route only the source app you want to stream to <code>CABLE Input (VB-Audio Virtual Cable)</code>.
+        </p>
+        <p class="small" style="margin-top: 10px;">
+          3. On this page, select <code>CABLE Output</code> as the source.
+        </p>
+        <p class="small" style="margin-top: 10px;">
+          4. Select your real speakers or headphones as the monitor output and set the delay to roughly match the phone latency.
+        </p>
+        <p class="small" style="margin-top: 10px;">
+          5. The phone hears the undelayed feed. Only the local monitor follows the delay slider.
+        </p>
+        <p class="small" style="margin-top: 10px;">
+          Connected listeners: <span id="listener-count">0</span>
+        </p>
+      </section>
+    </main>
+
+    <script src="/simplepeer.min.js"></script>
+    <script src="/common.js"></script>
+    <script src="/host.js"></script>
+  </body>
+</html>
