@@ -35,8 +35,46 @@ let remoteDiagnostics = {}
 let peerTransportStats = {}
 let lastPeerTraffic = {}
 let diagnosticsBusy = false
+let lastDiagnosticsText = ''
 const sourceVisualizer = createStreamVisualizer(sourceMeterCanvas, sourceMeterValue)
 const monitorVisualizer = createStreamVisualizer(monitorMeterCanvas, monitorMeterValue)
+
+function normalizeErrorMessage(error) {
+  if (!error) return 'unknown error'
+  if (typeof error === 'string') return error
+  if (error.message) return String(error.message)
+  return String(error)
+}
+
+function wait(ms) {
+  return new Promise(resolve => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+async function postSignalWithRetry(from, to, signal) {
+  const attempts = signal && signal.type === 'offer' ? 12 : 6
+  let lastError = null
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await postJson('/api/signal', { from, to, signal })
+      return
+    } catch (error) {
+      lastError = error
+      const message = normalizeErrorMessage(error)
+      const shouldRetry = /Target client is not connected/i.test(message)
+
+      if (!shouldRetry || attempt === attempts) {
+        throw error
+      }
+
+      await wait(150 * attempt)
+    }
+  }
+
+  throw lastError || new Error('Signal send failed')
+}
 
 function isCableDeviceLabel(label) {
   return /vb-audio|virtual cable|cable input|cable output/i.test(label || '')
@@ -76,16 +114,22 @@ function summarizePeer(listenerId, peer) {
     return `${listenerId}: no peer connection`
   }
 
+  const outboundProcessor = listenerProcessors.get(listenerId)
   const senders = typeof peer._pc.getSenders === 'function'
     ? peer._pc.getSenders().map(sender => summarizeTrack(sender.track))
     : []
   const stats = peerTransportStats[listenerId]
   const listenerParticipant = findParticipant(participants, listenerId)
   const outboundMode = listenerParticipant ? listenerParticipant.channelMode : 'n/a'
+  const outboundDelay = listenerParticipant ? listenerParticipant.delayMs : 'n/a'
 
   const lines = [
     `${listenerId}:`,
+    `  outboundDelayMs=${outboundDelay}`,
     `  outboundChannelMode=${outboundMode}`,
+    `  outboundProcessorLevel=${outboundProcessor && typeof outboundProcessor.getLevel === 'function'
+      ? outboundProcessor.getLevel().toFixed(4)
+      : 'n/a'}`,
     `  pc.connectionState=${peer._pc.connectionState || 'n/a'}`,
     `  pc.iceConnectionState=${peer._pc.iceConnectionState || 'n/a'}`,
     `  pc.signalingState=${peer._pc.signalingState || 'n/a'}`,
@@ -264,12 +308,12 @@ async function updatePeerStats() {
   }
 }
 
-function renderDiagnostics() {
+function getDiagnosticsText() {
   const peerLines = peers.size
     ? Array.from(peers.entries()).map(([listenerId, peer]) => summarizePeer(listenerId, peer))
     : ['no active listener peers']
 
-  const lines = [
+  return [
     `hostId=${hostId}`,
     `participants=${participants.length}`,
     `sourceDevice=${sourceDeviceSelect.value || 'none'}`,
@@ -280,12 +324,34 @@ function renderDiagnostics() {
     `monitorStream=${monitorProcessor ? summarizeStream(monitorProcessor.outputStream) : 'none'}`,
     `sourceMeterLevel=${Math.round(sourceVisualizer.getLevel() * 100)}%`,
     `monitorMeterLevel=${Math.round(monitorVisualizer.getLevel() * 100)}%`,
+    `monitorProcessorLevel=${monitorProcessor && typeof monitorProcessor.getLevel === 'function'
+      ? monitorProcessor.getLevel().toFixed(4)
+      : 'n/a'}`,
     `status="${statusBox.textContent}"`,
     '',
     ...peerLines
-  ]
+  ].join('\n')
+}
 
-  diagnosticsBox.textContent = lines.join('\n')
+function renderDiagnostics() {
+  diagnosticsBox.textContent = getDiagnosticsText()
+}
+
+async function pushDiagnostics() {
+  if (!getSelfParticipant()) return
+
+  const text = getDiagnosticsText()
+  if (text === lastDiagnosticsText) return
+  lastDiagnosticsText = text
+
+  try {
+    await postJson('/api/client-diagnostics', {
+      clientId: hostId,
+      text
+    })
+  } catch (error) {
+    console.debug('Host diagnostics push failed:', error)
+  }
 }
 
 function renderRemoteDiagnostics() {
@@ -316,6 +382,7 @@ function startDiagnostics() {
       })
       .finally(() => {
         renderDiagnostics()
+        pushDiagnostics().catch(() => {})
       })
   }, 1000)
 }
@@ -399,12 +466,7 @@ async function refreshMediaDevices(options) {
 function renderParticipants() {
   renderParticipantsTable(participantsBody, participants, hostId, {
     onAdjustDelay(targetClientId, delta) {
-      const participant = findParticipant(participants, targetClientId)
-      if (!participant) return
-
-      updateParticipantSettings(targetClientId, {
-        delayMs: clampDelay(participant.delayMs + delta)
-      }).catch(error => {
+      adjustParticipantDelay(participants, targetClientId, delta, updateParticipantSettings).catch(error => {
         setStatus(statusBox, error.message, 'warn')
       })
     },
@@ -442,6 +504,7 @@ function syncListenerOutboundSettings() {
   listenerProcessors.forEach((processor, listenerId) => {
     const participant = findParticipant(participants, listenerId)
     if (!participant || !processor) return
+    processor.setDelay(participant.delayMs)
     processor.setChannelMode(participant.channelMode)
   })
 }
@@ -522,7 +585,7 @@ async function startLocalMonitor() {
   stopLocalMonitor()
 
   const selfParticipant = getSelfParticipant() || {
-    delayMs: clampDelay(monitorDelayInput.value),
+    delayMs: 0,
     channelMode: 'stereo'
   }
 
@@ -568,11 +631,13 @@ async function createPeer(listenerId) {
   if (existingPeer) return existingPeer
 
   const listenerParticipant = findParticipant(participants, listenerId) || {
+    delayMs: 0,
     channelMode: 'stereo'
   }
   const outboundProcessor = await createProcessedAudioEngine(audioOnlyStream, {
-    delayMs: 0,
-    channelMode: listenerParticipant.channelMode
+    delayMs: listenerParticipant.delayMs,
+    channelMode: listenerParticipant.channelMode,
+    keepAliveDestination: true
   })
   const outboundStream = outboundProcessor.outputStream
 
@@ -582,29 +647,11 @@ async function createPeer(listenerId) {
     config: { iceServers: [] }
   })
 
-  if (outboundStream) {
-    outboundStream.getAudioTracks().forEach(track => {
-      try {
-        peer.addTrack(track, outboundStream)
-      } catch (error) {
-        console.error('Failed adding audio track to peer:', error)
-      }
-    })
-  }
-
-  peers.set(listenerId, peer)
-  listenerProcessors.set(listenerId, outboundProcessor)
-  renderDiagnostics()
-
   peer.on('signal', async signal => {
     try {
-      await postJson('/api/signal', {
-        from: hostId,
-        to: listenerId,
-        signal
-      })
+      await postSignalWithRetry(hostId, listenerId, signal)
     } catch (error) {
-      setStatus(statusBox, error.message, 'warn')
+      setStatus(statusBox, normalizeErrorMessage(error), 'warn')
     }
   })
 
@@ -628,6 +675,20 @@ async function createPeer(listenerId) {
     destroyPeer(listenerId)
     renderDiagnostics()
   })
+
+  if (outboundStream) {
+    outboundStream.getAudioTracks().forEach(track => {
+      try {
+        peer.addTrack(track, outboundStream)
+      } catch (error) {
+        console.error('Failed adding audio track to peer:', error)
+      }
+    })
+  }
+
+  peers.set(listenerId, peer)
+  listenerProcessors.set(listenerId, outboundProcessor)
+  renderDiagnostics()
 
   return peer
 }
@@ -714,6 +775,7 @@ async function stopBroadcast() {
     console.error(error)
   }
 
+  lastDiagnosticsText = ''
   updateParticipants([])
   startButton.disabled = false
   stopButton.disabled = true

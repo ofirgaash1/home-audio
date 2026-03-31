@@ -12,6 +12,7 @@ const playbackMeterCanvas = document.querySelector('#playback-meter')
 const playbackMeterValue = document.querySelector('#playback-meter-value')
 
 const listenerId = randomId('listener')
+const AudioContextClass = window.AudioContext || window.webkitAudioContext
 
 let eventSource = null
 let peer = null
@@ -19,9 +20,18 @@ let broadcasterId = null
 let participants = []
 let remoteStream = null
 let playbackProcessor = null
+let unlockedPlaybackContext = null
 let wakeLock = null
 let usingDirectPlaybackFallback = false
 let mediaReady = false
+let processedPlaybackPath = 'media-element-source'
+let preferredPlaybackMode = 'processed'
+let lastPlaybackFailure = null
+let lastPlayerEvent = 'none'
+let lastPlayerErrorCode = 'n/a'
+let playbackSessionId = 0
+let activePlaybackJob = null
+let activePlaybackStreamKey = ''
 let diagnosticsInterval = null
 let joined = false
 let lastDiagnosticsText = ''
@@ -47,8 +57,133 @@ let receiverStatsBusy = false
 const incomingVisualizer = createStreamVisualizer(incomingMeterCanvas, incomingMeterValue)
 const playbackVisualizer = createStreamVisualizer(playbackMeterCanvas, playbackMeterValue)
 
+function normalizeErrorMessage(error) {
+  if (!error) return 'unknown error'
+  if (typeof error === 'string') return error
+  if (error.message) return String(error.message)
+  return String(error)
+}
+
+function summarizeErrorStack(error) {
+  if (!error || !error.stack) return 'n/a'
+  return String(error.stack).replace(/\s+/g, ' ').slice(0, 240)
+}
+
+function wait(ms) {
+  return new Promise(resolve => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+async function postSignalWithRetry(from, to, signal) {
+  const attempts = signal && signal.type === 'answer' ? 12 : 6
+  let lastError = null
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await postJson('/api/signal', { from, to, signal })
+      return
+    } catch (error) {
+      lastError = error
+      const message = normalizeErrorMessage(error)
+      const shouldRetry = /Target client is not connected/i.test(message)
+
+      if (!shouldRetry || attempt === attempts) {
+        throw error
+      }
+
+      await wait(150 * attempt)
+    }
+  }
+
+  throw lastError || new Error('Signal send failed')
+}
+
+function describePlaybackFailure(error) {
+  const name = error && error.name ? String(error.name) : 'Error'
+  const message = normalizeErrorMessage(error)
+  return `${name}: ${message}`.slice(0, 180)
+}
+
+function clearPlaybackFailure() {
+  lastPlaybackFailure = null
+}
+
+function recordPlaybackFailure(stage, sourceLabel, error) {
+  lastPlaybackFailure = {
+    at: new Date().toISOString(),
+    stage: stage || 'unknown',
+    source: sourceLabel || 'unknown',
+    name: error && error.name ? String(error.name) : 'Error',
+    message: normalizeErrorMessage(error),
+    stack: summarizeErrorStack(error)
+  }
+}
+
+function getStreamKey(stream) {
+  if (!stream) return 'none'
+
+  const trackKeys = stream.getTracks()
+    .map(track => `${track.kind}:${track.id}:${track.readyState}`)
+    .sort()
+
+  return `${stream.id}|${trackKeys.join('|')}`
+}
+
+function createStalePlaybackError() {
+  const error = new Error('Stale playback request')
+  error.name = 'StalePlaybackError'
+  return error
+}
+
+function assertCurrentPlaybackSession(sessionId) {
+  if (sessionId !== playbackSessionId) {
+    throw createStalePlaybackError()
+  }
+}
+
+function shouldPreferDirectPlayback() {
+  const userAgent = navigator.userAgent || ''
+  const looksMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent)
+  const hasTouch = typeof navigator.maxTouchPoints === 'number' && navigator.maxTouchPoints > 1
+  return looksMobile || hasTouch
+}
+
 function getSelfParticipant() {
   return findParticipant(participants, listenerId)
+}
+
+async function ensureUnlockedPlaybackContext() {
+  if (!AudioContextClass) return null
+
+  if (!unlockedPlaybackContext || unlockedPlaybackContext.state === 'closed') {
+    unlockedPlaybackContext = new AudioContextClass()
+  }
+
+  if (unlockedPlaybackContext.state === 'suspended') {
+    await unlockedPlaybackContext.resume()
+  }
+
+  return unlockedPlaybackContext
+}
+
+async function primeAudioContexts() {
+  await Promise.allSettled([
+    ensureUnlockedPlaybackContext(),
+    incomingVisualizer.prime(),
+    playbackVisualizer.prime()
+  ])
+}
+
+async function closeUnlockedPlaybackContext() {
+  if (!unlockedPlaybackContext) return
+
+  const contextToClose = unlockedPlaybackContext
+  unlockedPlaybackContext = null
+
+  if (contextToClose.state !== 'closed') {
+    await contextToClose.close()
+  }
 }
 
 function summarizeTrack(track) {
@@ -231,10 +366,7 @@ async function updateReceiverStats() {
       mediaReady &&
       !usingDirectPlaybackFallback &&
       playbackProcessor &&
-      remoteStream &&
-      player.srcObject &&
-      playbackProcessor.outputStream &&
-      player.srcObject.id === playbackProcessor.outputStream.id
+      remoteStream
     )
 
     if (!processingActive) {
@@ -243,7 +375,9 @@ async function updateReceiverStats() {
     }
 
     const incomingLevel = incomingVisualizer.getLevel()
-    const playbackLevel = playbackVisualizer.getLevel()
+    const playbackLevel = playbackProcessor && typeof playbackProcessor.getLevel === 'function'
+      ? playbackProcessor.getLevel()
+      : playbackVisualizer.getLevel()
     const hasInboundTraffic = deltaBytes > 1200 || deltaPackets > 15
     const playbackLooksSilent = playbackLevel < 0.01
     const incomingLooksSilent = incomingLevel < 0.01
@@ -260,7 +394,8 @@ async function updateReceiverStats() {
       silentPlaybackStreak = 0
       await startDirectPlaybackFallback(
         remoteStream,
-        'Processed playback stayed silent on this device, so direct fallback was enabled.'
+        'Processed playback stayed silent on this device, so direct fallback was enabled.',
+        playbackSessionId
       )
     }
   } finally {
@@ -293,9 +428,26 @@ function getDiagnosticsText() {
     `player.playbackRate=${player.playbackRate}`,
     `player.ended=${player.ended}`,
     `player.srcObject=${player.srcObject ? summarizeStream(player.srcObject) : 'none'}`,
+    `player.errorCode=${player.error && typeof player.error.code === 'number' ? player.error.code : lastPlayerErrorCode}`,
+    `lastPlayerEvent=${lastPlayerEvent}`,
+    `processedPlaybackPath=${processedPlaybackPath}`,
+    `preferredPlaybackMode=${preferredPlaybackMode}`,
     `playbackProcessor=${playbackProcessor ? 'active' : 'none'}`,
+    `listenerContext.state=${unlockedPlaybackContext ? unlockedPlaybackContext.state : 'n/a'}`,
     `processor.context.state=${processorContext ? processorContext.state : 'n/a'}`,
     `processor.context.sampleRate=${processorContext ? processorContext.sampleRate : 'n/a'}`,
+    `processor.level=${playbackProcessor && typeof playbackProcessor.getLevel === 'function'
+      ? playbackProcessor.getLevel().toFixed(4)
+      : 'n/a'}`,
+    `browser.userAgent=${navigator.userAgent || 'n/a'}`,
+    `browser.platform=${navigator.platform || 'n/a'}`,
+    `browser.vendor=${navigator.vendor || 'n/a'}`,
+    `browser.maxTouchPoints=${typeof navigator.maxTouchPoints === 'number' ? navigator.maxTouchPoints : 'n/a'}`,
+    `capabilities.audioContext=${AudioContextClass ? 'yes' : 'no'}`,
+    `capabilities.mediaSession=${'mediaSession' in navigator ? 'yes' : 'no'}`,
+    `capabilities.wakeLock=${'wakeLock' in navigator ? 'yes' : 'no'}`,
+    `capabilities.createMediaElementSource=${AudioContextClass && typeof AudioContextClass.prototype.createMediaElementSource === 'function' ? 'yes' : 'no'}`,
+    `capabilities.createMediaStreamSource=${AudioContextClass && typeof AudioContextClass.prototype.createMediaStreamSource === 'function' ? 'yes' : 'no'}`,
     `remoteTrack=${summarizeTrack(remoteTrack)}`,
     `remoteTrack.muted=${remoteTrack ? remoteTrack.muted : 'n/a'}`,
     `remoteTrack.settings=${summarizeTrackSettings(remoteTrack)}`,
@@ -319,6 +471,12 @@ function getDiagnosticsText() {
     `receiver.audioLevel=${receiverStats.audioLevel}`,
     `receiver.codec=${receiverStats.codec}`,
     `silentFallbackStreak=${silentPlaybackStreak}`,
+    `lastPlaybackFailure.at=${lastPlaybackFailure ? lastPlaybackFailure.at : 'n/a'}`,
+    `lastPlaybackFailure.stage=${lastPlaybackFailure ? lastPlaybackFailure.stage : 'n/a'}`,
+    `lastPlaybackFailure.source=${lastPlaybackFailure ? lastPlaybackFailure.source : 'n/a'}`,
+    `lastPlaybackFailure.name=${lastPlaybackFailure ? lastPlaybackFailure.name : 'n/a'}`,
+    `lastPlaybackFailure.message=${lastPlaybackFailure ? lastPlaybackFailure.message : 'n/a'}`,
+    `lastPlaybackFailure.stack=${lastPlaybackFailure ? lastPlaybackFailure.stack : 'n/a'}`,
     `receivers=${summarizeReceivers(peer)}`,
     `pc.connectionState=${pc ? (pc.connectionState || 'n/a') : 'n/a'}`,
     `pc.iceConnectionState=${pc ? (pc.iceConnectionState || 'n/a') : 'n/a'}`,
@@ -367,12 +525,7 @@ function startDiagnostics() {
 function renderParticipants() {
   renderParticipantsTable(participantsBody, participants, listenerId, {
     onAdjustDelay(targetClientId, delta) {
-      const participant = findParticipant(participants, targetClientId)
-      if (!participant) return
-
-      updateParticipantSettings(targetClientId, {
-        delayMs: clampDelay(participant.delayMs + delta)
-      }).catch(error => {
+      adjustParticipantDelay(participants, targetClientId, delta, updateParticipantSettings).catch(error => {
         setStatus(statusBox, error.message, 'warn')
       })
     },
@@ -444,14 +597,19 @@ function configureMediaSession() {
 
     navigator.mediaSession.setActionHandler('play', async () => {
       try {
-        if (playbackProcessor) {
+        if (playbackProcessor && !usingDirectPlaybackFallback) {
           await playbackProcessor.context.resume()
+          return
         }
         await player.play()
       } catch (error) {}
     })
 
     navigator.mediaSession.setActionHandler('pause', () => {
+      if (playbackProcessor && !usingDirectPlaybackFallback) {
+        playbackProcessor.context.suspend().catch(() => {})
+        return
+      }
       player.pause()
     })
   } catch (error) {
@@ -461,6 +619,9 @@ function configureMediaSession() {
 
 function destroyPeer() {
   if (!peer) return
+  playbackSessionId += 1
+  activePlaybackJob = null
+  activePlaybackStreamKey = ''
   peer.destroy()
   peer = null
   resetReceiverStats()
@@ -469,6 +630,7 @@ function destroyPeer() {
 async function stopPlayback(options) {
   const preserveRemoteStream = Boolean(options && options.preserveRemoteStream)
   player.pause()
+  player.muted = false
   player.srcObject = null
   if (!preserveRemoteStream) {
     remoteStream = null
@@ -476,6 +638,7 @@ async function stopPlayback(options) {
   }
   usingDirectPlaybackFallback = false
   mediaReady = false
+  lastPlayerErrorCode = 'n/a'
   resetReceiverStats()
 
   if (playbackProcessor) {
@@ -487,26 +650,46 @@ async function stopPlayback(options) {
   renderDiagnostics()
 }
 
-async function startPlayback(stream) {
+async function startPlayback(stream, sessionId) {
   await stopPlayback({ preserveRemoteStream: true })
+  assertCurrentPlaybackSession(sessionId)
+  clearPlaybackFailure()
+  processedPlaybackPath = 'media-element-source'
+  preferredPlaybackMode = 'processed'
 
   const selfParticipant = getSelfParticipant() || {
-    delayMs: 100,
+    delayMs: 0,
     channelMode: 'stereo'
   }
 
-  playbackProcessor = await createProcessedAudioEngine(stream, {
-    delayMs: selfParticipant.delayMs,
-    channelMode: selfParticipant.channelMode
-  })
+  const playbackContext = await ensureUnlockedPlaybackContext()
+  assertCurrentPlaybackSession(sessionId)
+  player.srcObject = stream
+  player.muted = true
+  await player.play()
+  assertCurrentPlaybackSession(sessionId)
 
-  player.srcObject = playbackProcessor.outputStream
+  const nextPlaybackProcessor = await createProcessedElementAudioEngine(player, {
+    delayMs: selfParticipant.delayMs,
+    channelMode: selfParticipant.channelMode,
+    context: playbackContext,
+    audibleDestination: true
+  })
+  if (sessionId !== playbackSessionId) {
+    await nextPlaybackProcessor.close().catch(() => {})
+    throw createStalePlaybackError()
+  }
+  playbackProcessor = nextPlaybackProcessor
+
   await playbackVisualizer.attachStream(playbackProcessor.outputStream)
+  assertCurrentPlaybackSession(sessionId)
   configureMediaSession()
   await requestWakeLock()
+  assertCurrentPlaybackSession(sessionId)
 
   try {
-    await player.play()
+    await playbackProcessor.context.resume()
+    assertCurrentPlaybackSession(sessionId)
     mediaReady = true
     setStatus(statusBox, 'Audio is playing.')
     renderDiagnostics()
@@ -516,27 +699,39 @@ async function startPlayback(stream) {
   }
 }
 
-async function startDirectPlaybackFallback(stream, reason) {
+async function startDirectPlaybackFallback(stream, reason, sessionId) {
   await stopPlayback({ preserveRemoteStream: true })
+  assertCurrentPlaybackSession(sessionId)
   usingDirectPlaybackFallback = true
+  processedPlaybackPath = 'direct-fallback'
+  const preferredDirectMode = shouldPreferDirectPlayback()
+  preferredPlaybackMode = preferredDirectMode ? 'direct-preferred' : 'processed-fallback'
   player.srcObject = stream
+  player.muted = false
   await playbackVisualizer.attachStream(stream)
+  assertCurrentPlaybackSession(sessionId)
   configureMediaSession()
   await requestWakeLock()
+  assertCurrentPlaybackSession(sessionId)
 
   try {
     await player.play()
+    assertCurrentPlaybackSession(sessionId)
     mediaReady = true
     setStatus(
       statusBox,
-      `Audio is playing with direct fallback. Delay/channel controls may not apply on this device. ${reason || ''}`.trim(),
-      'warn'
+      preferredDirectMode
+        ? `Audio is playing in direct mode on this device. Delay/channel controls are applied upstream when available. ${reason || ''}`.trim()
+        : `Audio is playing with direct fallback on this device. Delay/channel controls are applied upstream when available. ${reason || ''}`.trim(),
+      preferredDirectMode ? null : 'warn'
     )
     renderDiagnostics()
   } catch (error) {
     setStatus(
       statusBox,
-      'Tap the audio control to start playback. This phone rejected the processed audio path, so direct playback fallback is loaded.',
+      preferredDirectMode
+        ? 'Tap the audio control to start direct playback on this device.'
+        : 'Tap the audio control to start playback. This phone rejected the processed audio path, so direct playback fallback is loaded.',
       'warn'
     )
     renderDiagnostics()
@@ -545,20 +740,53 @@ async function startDirectPlaybackFallback(stream, reason) {
 
 async function handleIncomingMediaStream(stream, sourceLabel) {
   if (!stream) return
-  if (mediaReady && remoteStream && remoteStream.id === stream.id) return
+
+  const streamKey = getStreamKey(stream)
+  if (streamKey === activePlaybackStreamKey && (mediaReady || activePlaybackJob)) {
+    return activePlaybackJob || undefined
+  }
 
   remoteStream = stream
+  activePlaybackStreamKey = streamKey
   await incomingVisualizer.attachStream(stream)
   renderDiagnostics()
 
+  const sessionId = ++playbackSessionId
+  const job = (async () => {
+    try {
+      if (shouldPreferDirectPlayback()) {
+        await startDirectPlaybackFallback(
+          stream,
+          'This device uses direct playback for stability. Delay/channel controls are applied upstream.',
+          sessionId
+        )
+        return
+      }
+
+      await startPlayback(stream, sessionId)
+    } catch (error) {
+      if ((error && error.name === 'StalePlaybackError') || sessionId !== playbackSessionId) {
+        return
+      }
+
+      recordPlaybackFailure('startPlayback', sourceLabel, error)
+      console.error(error)
+      await startDirectPlaybackFallback(
+        stream,
+        `${sourceLabel || 'Processed playback'} failed on this device/browser. ${describePlaybackFailure(error)}`,
+        sessionId
+      )
+    }
+  })()
+
+  activePlaybackJob = job
+
   try {
-    await startPlayback(stream)
-  } catch (error) {
-    console.error(error)
-    await startDirectPlaybackFallback(
-      stream,
-      `${sourceLabel || 'Processed playback'} failed on this device/browser.`
-    )
+    await job
+  } finally {
+    if (activePlaybackJob === job) {
+      activePlaybackJob = null
+    }
   }
 }
 
@@ -645,11 +873,7 @@ function createPeer(hostClientId) {
 
   nextPeer.on('signal', async signal => {
     try {
-      await postJson('/api/signal', {
-        from: listenerId,
-        to: hostClientId,
-        signal
-      })
+      await postSignalWithRetry(listenerId, hostClientId, signal)
     } catch (error) {
       setStatus(statusBox, error.message, 'warn')
     }
@@ -704,7 +928,7 @@ async function joinAudio() {
     clientId: listenerId,
     role: 'listener',
     settings: {
-      delayMs: 100,
+      delayMs: 0,
       channelMode: 'stereo'
     }
   })
@@ -722,6 +946,7 @@ async function joinAudio() {
 async function leaveAudio() {
   destroyPeer()
   await stopPlayback()
+  await closeUnlockedPlaybackContext().catch(() => {})
   broadcasterId = null
   joined = false
   lastDiagnosticsText = ''
@@ -745,6 +970,7 @@ joinButton.addEventListener('click', async () => {
   setStatus(statusBox, 'Joining...')
 
   try {
+    await primeAudioContexts()
     await joinAudio()
   } catch (error) {
     console.error(error)
@@ -761,9 +987,20 @@ leaveButton.addEventListener('click', () => {
   })
 })
 
+;['loadstart', 'loadedmetadata', 'canplay', 'play', 'playing', 'pause', 'waiting', 'stalled', 'suspend', 'error'].forEach(type => {
+  player.addEventListener(type, () => {
+    lastPlayerEvent = `${type}@${new Date().toISOString()}`
+    lastPlayerErrorCode = player.error && typeof player.error.code === 'number'
+      ? String(player.error.code)
+      : 'n/a'
+    renderDiagnostics()
+  })
+})
+
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
     requestWakeLock().catch(() => {})
+    ensureUnlockedPlaybackContext().catch(() => {})
     incomingVisualizer.resume().catch(() => {})
     playbackVisualizer.resume().catch(() => {})
     if (playbackProcessor) {
@@ -779,6 +1016,7 @@ window.addEventListener('beforeunload', () => {
   releaseWakeLock()
   incomingVisualizer.close().catch(() => {})
   playbackVisualizer.close().catch(() => {})
+  closeUnlockedPlaybackContext().catch(() => {})
   if (diagnosticsInterval) {
     window.clearInterval(diagnosticsInterval)
   }

@@ -10,6 +10,20 @@ const PORT = Number(process.env.PORT || 43117)
 const HOST = process.env.HOST || '0.0.0.0'
 const PUBLIC_DIR = path.join(__dirname, 'public')
 const SIMPLE_PEER_PATH = path.join(__dirname, '..', 'simplepeer.min.js')
+const DEBUG_LOG_PATH = path.resolve(
+  process.env.HOME_AUDIO_DEBUG_LOG || path.join(os.tmpdir(), 'home-audio', 'debug.ndjson')
+)
+const MAX_DEBUG_EVENTS = Math.max(
+  50,
+  Math.min(5000, Number(process.env.HOME_AUDIO_DEBUG_MAX_EVENTS || 400) || 400)
+)
+const DELAY_MIN_MS = 0
+const DELAY_MAX_MS = 300
+const DELAY_STEP_MS = 5
+
+function ensureDebugLogDirectory() {
+  fs.mkdirSync(path.dirname(DEBUG_LOG_PATH), { recursive: true })
+}
 
 function getMimeType(filePath) {
   const ext = path.extname(filePath).toLowerCase()
@@ -103,27 +117,136 @@ function serveFile(res, filePath) {
 function createState() {
   return {
     broadcasterId: null,
-    clients: new Map()
+    clients: new Map(),
+    startedAt: new Date().toISOString(),
+    nextDebugEventId: 1,
+    debugEvents: [],
+    debugSubscribers: new Set(),
+    counters: {
+      registerRequests: 0,
+      unregisterRequests: 0,
+      signalMessages: 0,
+      participantSettingsUpdates: 0,
+      diagnosticsUpdates: 0
+    }
   }
 }
 
 function getDefaultSettings(role) {
   return {
-    delayMs: role === 'broadcaster' ? 250 : 100,
+    delayMs: 0,
     channelMode: 'stereo'
   }
 }
 
 function clampDelay(value) {
   const delay = Number(value)
-  if (!Number.isFinite(delay)) return 0
-  return Math.max(0, Math.min(5000, Math.round(delay)))
+  if (!Number.isFinite(delay)) return DELAY_MIN_MS
+  const snapped = Math.round(delay / DELAY_STEP_MS) * DELAY_STEP_MS
+  return Math.max(DELAY_MIN_MS, Math.min(DELAY_MAX_MS, snapped))
 }
 
 function normalizeChannelMode(mode) {
   if (mode === 'mono') return mode
   if (mode === 'left' || mode === 'right') return mode
   return 'stereo'
+}
+
+function decodeQuotedValue(value) {
+  if (typeof value !== 'string') return ''
+  if (value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"') {
+    return value.slice(1, -1)
+  }
+  return value
+}
+
+function parseDiagnosticsSummary(text) {
+  if (typeof text !== 'string' || !text) {
+    return {}
+  }
+
+  const lines = text.split(/\r?\n/)
+  const keys = [
+    'status',
+    'mediaReady',
+    'directFallback',
+    'processedPlaybackPath',
+    'listenerContext.state',
+    'processor.context.state',
+    'processor.context.sampleRate',
+    'processor.level',
+    'incomingMeterLevel',
+    'playbackMeterLevel',
+    'sourceMeterLevel',
+    'monitorMeterLevel',
+    'monitorProcessorLevel',
+    'receiver.deltaBytes',
+    'receiver.deltaPackets',
+    'receiver.codec',
+    'silentFallbackStreak',
+    'lastPlayerEvent',
+    'player.errorCode',
+    'lastPlaybackFailure.at',
+    'lastPlaybackFailure.stage',
+    'lastPlaybackFailure.source',
+    'lastPlaybackFailure.name',
+    'lastPlaybackFailure.message',
+    'pc.connectionState',
+    'pc.iceConnectionState',
+    'pc.signalingState'
+  ]
+
+  const summary = {}
+
+  keys.forEach(key => {
+    const prefix = `${key}=`
+    const line = lines.find(entry => entry.startsWith(prefix))
+    if (!line) return
+    summary[key] = decodeQuotedValue(line.slice(prefix.length))
+  })
+
+  return summary
+}
+
+function appendDebugEvent(event) {
+  try {
+    ensureDebugLogDirectory()
+  } catch (error) {
+    console.error(`Failed preparing debug log directory: ${error.message}`)
+    return
+  }
+
+  fs.appendFile(DEBUG_LOG_PATH, `${JSON.stringify(event)}\n`, error => {
+    if (error) {
+      console.error(`Failed writing debug event log: ${error.message}`)
+    }
+  })
+}
+
+function recordDebugEvent(state, type, details) {
+  const event = {
+    id: state.nextDebugEventId,
+    at: new Date().toISOString(),
+    type,
+    ...(details || {})
+  }
+
+  state.nextDebugEventId += 1
+  state.debugEvents.push(event)
+
+  if (state.debugEvents.length > MAX_DEBUG_EVENTS) {
+    state.debugEvents.shift()
+  }
+
+  appendDebugEvent(event)
+
+  state.debugSubscribers.forEach(res => {
+    try {
+      sendEvent({ res }, 'debug', { event })
+    } catch (error) {}
+  })
+
+  return event
 }
 
 function getOrCreateClient(state, clientId) {
@@ -134,7 +257,10 @@ function getOrCreateClient(state, clientId) {
       role: null,
       res: null,
       settings: null,
-      diagnostics: ''
+      diagnostics: '',
+      diagnosticsAt: null,
+      lastDirectFallbackAt: null,
+      lastDirectFallbackStatus: ''
     }
     state.clients.set(clientId, client)
   }
@@ -160,26 +286,37 @@ function applyClientSettings(client, role, nextSettings) {
   return merged
 }
 
-function getClientLabel(client) {
-  if (client.role === 'broadcaster') return 'Host'
-  return `Listener ${client.id.slice(-4)}`
-}
-
 function getParticipantsSnapshot(state) {
-  return Array.from(state.clients.values())
+  const activeClients = Array.from(state.clients.values())
     .filter(client => client.role)
-    .map(client => ({
-      clientId: client.id,
-      role: client.role,
-      label: getClientLabel(client),
-      delayMs: client.settings ? client.settings.delayMs : getDefaultSettings(client.role).delayMs,
-      channelMode: client.settings ? client.settings.channelMode : 'stereo'
-    }))
     .sort((left, right) => {
       if (left.role === 'broadcaster' && right.role !== 'broadcaster') return -1
       if (right.role === 'broadcaster' && left.role !== 'broadcaster') return 1
-      return left.label.localeCompare(right.label)
+      return left.id.localeCompare(right.id)
     })
+
+  let listenerIndex = 0
+
+  return activeClients
+    .map(client => {
+      const label = client.role === 'broadcaster'
+        ? 'Host'
+        : `Listener ${++listenerIndex}`
+
+      return {
+        clientId: client.id,
+        role: client.role,
+        label,
+        delayMs: client.settings ? client.settings.delayMs : getDefaultSettings(client.role).delayMs,
+        channelMode: client.settings ? client.settings.channelMode : 'stereo'
+      }
+    })
+}
+
+function getParticipantLabelMap(state) {
+  return new Map(
+    getParticipantsSnapshot(state).map(participant => [participant.clientId, participant.label])
+  )
 }
 
 function broadcastParticipants(state) {
@@ -194,7 +331,49 @@ function broadcastParticipants(state) {
   return participants
 }
 
+function getClientDebugSnapshot(client, labelMap) {
+  const diagnosticsSummary = parseDiagnosticsSummary(client.diagnostics)
+
+  return {
+    clientId: client.id,
+    role: client.role,
+    label: client.role ? (labelMap.get(client.id) || null) : null,
+    connected: Boolean(client.res),
+    settings: client.settings || null,
+    diagnosticsAt: client.diagnosticsAt,
+    diagnosticsSummary,
+    diagnostics: client.diagnostics || '',
+    lastDirectFallbackAt: client.lastDirectFallbackAt,
+    lastDirectFallbackStatus: client.lastDirectFallbackStatus || ''
+  }
+}
+
+function getDebugStateSnapshot(state, activePort) {
+  const labelMap = getParticipantLabelMap(state)
+
+  return {
+    server: {
+      host: HOST,
+      port: activePort,
+      startedAt: state.startedAt,
+      debugLogPath: DEBUG_LOG_PATH
+    },
+    broadcasterId: state.broadcasterId,
+    participants: getParticipantsSnapshot(state),
+    clients: Array.from(state.clients.values())
+      .map(client => getClientDebugSnapshot(client, labelMap))
+      .filter(client => client.role || client.connected || client.diagnostics || client.lastDirectFallbackAt),
+    counters: {
+      ...state.counters,
+      activeClientConnections: Array.from(state.clients.values()).filter(client => client.role).length,
+      debugSubscribers: state.debugSubscribers.size
+    },
+    recentEvents: state.debugEvents.slice(-100)
+  }
+}
+
 function getDiagnosticsSnapshot(state) {
+  const labelMap = getParticipantLabelMap(state)
   const diagnostics = {}
 
   state.clients.forEach(client => {
@@ -202,8 +381,9 @@ function getDiagnosticsSnapshot(state) {
     diagnostics[client.id] = {
       clientId: client.id,
       role: client.role,
-      label: getClientLabel(client),
-      text: client.diagnostics || ''
+      label: labelMap.get(client.id) || null,
+      text: client.diagnostics || '',
+      updatedAt: client.diagnosticsAt
     }
   })
 
@@ -228,9 +408,18 @@ function listListenerIds(state) {
     .map(client => client.id)
 }
 
-function unregisterClient(state, clientId) {
+function unregisterClient(state, clientId, reason) {
   const client = state.clients.get(clientId)
   if (!client) return
+  if (!client.role) {
+    client.settings = null
+    client.diagnostics = ''
+    client.diagnosticsAt = null
+    return
+  }
+
+  const previousRole = client.role
+  const previousSettings = client.settings
 
   if (client.role === 'listener' && state.broadcasterId) {
     const broadcaster = state.clients.get(state.broadcasterId)
@@ -246,9 +435,17 @@ function unregisterClient(state, clientId) {
     })
   }
 
+  recordDebugEvent(state, 'unregister', {
+    clientId,
+    role: previousRole,
+    reason: reason || 'unknown',
+    settings: previousSettings || null
+  })
+
   client.role = null
   client.settings = null
   client.diagnostics = ''
+  client.diagnosticsAt = null
   broadcastParticipants(state)
   broadcastDiagnostics(state)
 }
@@ -278,7 +475,30 @@ function attachSse(state, req, res, parsedUrl) {
     const currentClient = state.clients.get(clientId)
     if (!currentClient) return
     currentClient.res = null
-    unregisterClient(state, clientId)
+    unregisterClient(state, clientId, 'sse-close')
+  })
+}
+
+function attachDebugEvents(state, req, res, activePort) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-store',
+    Connection: 'keep-alive',
+    'Access-Control-Allow-Origin': '*'
+  })
+
+  res.write(': debug connected\n\n')
+  state.debugSubscribers.add(res)
+  sendEvent({ res }, 'ready', {
+    startedAt: state.startedAt,
+    debugLogPath: DEBUG_LOG_PATH
+  })
+  sendEvent({ res }, 'snapshot', {
+    state: getDebugStateSnapshot(state, activePort)
+  })
+
+  req.on('close', () => {
+    state.debugSubscribers.delete(res)
   })
 }
 
@@ -286,6 +506,8 @@ async function handleRegister(state, req, res) {
   const body = await readBody(req)
   const clientId = body.clientId
   const role = body.role
+
+  state.counters.registerRequests += 1
 
   if (!clientId || !role) {
     sendJson(res, 400, { error: 'Missing clientId or role' })
@@ -298,6 +520,8 @@ async function handleRegister(state, req, res) {
   }
 
   const client = getOrCreateClient(state, clientId)
+  client.lastDirectFallbackAt = null
+  client.lastDirectFallbackStatus = ''
 
   if (role === 'broadcaster') {
     if (state.broadcasterId && state.broadcasterId !== clientId) {
@@ -308,6 +532,11 @@ async function handleRegister(state, req, res) {
     state.broadcasterId = clientId
     client.role = 'broadcaster'
     applyClientSettings(client, role, body.settings)
+    recordDebugEvent(state, 'register', {
+      clientId,
+      role,
+      settings: client.settings
+    })
 
     const participants = broadcastParticipants(state)
     broadcastDiagnostics(state)
@@ -323,6 +552,12 @@ async function handleRegister(state, req, res) {
 
   client.role = 'listener'
   applyClientSettings(client, role, body.settings)
+  recordDebugEvent(state, 'register', {
+    clientId,
+    role,
+    settings: client.settings,
+    broadcasterId: state.broadcasterId
+  })
 
   const broadcaster = state.broadcasterId
     ? state.clients.get(state.broadcasterId)
@@ -345,12 +580,13 @@ async function handleRegister(state, req, res) {
 
 async function handleUnregister(state, req, res) {
   const body = await readBody(req)
+  state.counters.unregisterRequests += 1
   if (!body.clientId) {
     sendJson(res, 400, { error: 'Missing clientId' })
     return
   }
 
-  unregisterClient(state, body.clientId)
+  unregisterClient(state, body.clientId, 'api-unregister')
   sendJson(res, 200, { ok: true })
 }
 
@@ -371,6 +607,12 @@ async function handleSignal(state, req, res) {
     return
   }
 
+  state.counters.signalMessages += 1
+  recordDebugEvent(state, 'signal', {
+    from,
+    to,
+    signalType: signal.type || (signal.candidate ? 'candidate' : 'unknown')
+  })
   sendEvent(target, 'signal', { from, signal })
   sendJson(res, 200, { ok: true })
 }
@@ -391,6 +633,13 @@ async function handleParticipantSettings(state, req, res) {
   }
 
   applyClientSettings(target, target.role, body.settings)
+  state.counters.participantSettingsUpdates += 1
+  recordDebugEvent(state, 'participant-settings', {
+    actorClientId: body.clientId || null,
+    targetClientId,
+    role: target.role,
+    settings: target.settings
+  })
   const participants = broadcastParticipants(state)
   sendJson(res, 200, { ok: true, participants })
 }
@@ -411,7 +660,25 @@ async function handleClientDiagnostics(state, req, res) {
     return
   }
 
+  const previousText = client.diagnostics
+  const diagnosticsAt = new Date().toISOString()
+  const diagnosticsSummary = parseDiagnosticsSummary(text)
   client.diagnostics = text
+  client.diagnosticsAt = diagnosticsAt
+
+  if (diagnosticsSummary.directFallback === 'yes') {
+    client.lastDirectFallbackAt = diagnosticsAt
+    client.lastDirectFallbackStatus = diagnosticsSummary.status || client.lastDirectFallbackStatus || ''
+  }
+
+  state.counters.diagnosticsUpdates += 1
+  recordDebugEvent(state, 'diagnostics', {
+    clientId,
+    role: client.role,
+    changed: previousText !== text,
+    diagnosticsAt,
+    summary: diagnosticsSummary
+  })
   const diagnostics = broadcastDiagnostics(state)
   sendJson(res, 200, { ok: true, diagnostics })
 }
@@ -436,6 +703,16 @@ function createServer() {
 
       if (req.method === 'GET' && parsedUrl.pathname === '/events') {
         attachSse(state, req, res, parsedUrl)
+        return
+      }
+
+      if (req.method === 'GET' && parsedUrl.pathname === '/api/debug/events') {
+        attachDebugEvents(state, req, res, activePort)
+        return
+      }
+
+      if (req.method === 'GET' && parsedUrl.pathname === '/api/debug/state') {
+        sendJson(res, 200, getDebugStateSnapshot(state, activePort))
         return
       }
 
@@ -504,18 +781,28 @@ function createServer() {
     }
   })
 
+  server.homeAudioState = state
   return server
 }
 
 function startServer() {
+  ensureDebugLogDirectory()
   const server = createServer()
 
   server.listen(PORT, HOST, () => {
     const address = server.address()
     const activePort = address && typeof address === 'object' ? address.port : PORT
     const lanUrls = getLanAddresses(activePort)
+    recordDebugEvent(server.homeAudioState, 'server-start', {
+      host: HOST,
+      port: activePort,
+      debugLogPath: DEBUG_LOG_PATH
+    })
     console.log(`LAN audio server running on port ${activePort}`)
     console.log(`Host page: http://localhost:${activePort}/host`)
+    console.log(`Debug state: http://localhost:${activePort}/api/debug/state`)
+    console.log(`Debug events: http://localhost:${activePort}/api/debug/events`)
+    console.log(`Debug log: ${DEBUG_LOG_PATH}`)
     if (lanUrls.length) {
       console.log('Phone listener pages:')
       lanUrls.forEach(url => {

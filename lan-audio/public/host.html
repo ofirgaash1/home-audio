@@ -27,8 +27,8 @@
             <div class="button-row" style="margin-top: 10px;">
               <select id="monitor-device"></select>
             </div>
-            <p class="small" style="margin-top: 12px;">Delay: <span id="monitor-delay-value">250 ms</span></p>
-            <input id="monitor-delay" type="range" min="0" max="1500" step="10" value="250" style="width: 100%; margin-top: 10px;">
+            <p class="small" style="margin-top: 12px;">Delay: <span id="monitor-delay-value">0 ms</span></p>
+            <input id="monitor-delay" type="range" min="0" max="300" step="5" value="0" style="width: 100%; margin-top: 10px;">
             <div class="button-row preset-row" style="margin-top: 12px;">
               <button type="button" class="secondary preset-button" data-delay="100">Phone (100 ms)</button>
               <button type="button" class="secondary preset-button" data-delay="110">Sony WF-1000XM5 (110 ms)</button>
@@ -42,6 +42,16 @@
         </div>
         <div class="status" id="status">Waiting to start.</div>
         <audio id="monitor-player" autoplay playsinline hidden></audio>
+      </section>
+
+      <section class="panel">
+        <h2>Participants</h2>
+        <p class="small">Everyone can change every participant's delay and channel mode. On mobile direct mode, delay and channel changes are applied upstream by the host.</p>
+        <div class="table-wrap">
+          <table class="participant-table">
+            <tbody id="participants-body"></tbody>
+          </table>
+        </div>
       </section>
 
       <section class="panel">
@@ -69,24 +79,6 @@
         <h2>Phone URL</h2>
         <p class="small">Open one of these on your phone while it is on the same Wi-Fi.</p>
         <div class="links" id="listen-links"></div>
-      </section>
-
-      <section class="panel">
-        <h2>Participants</h2>
-        <p class="small">Everyone can change every participant's delay and channel mode. Delay changes apply only to that participant's local playback path.</p>
-        <div class="table-wrap">
-          <table class="participant-table">
-            <thead>
-              <tr>
-                <th>Participant</th>
-                <th>Role</th>
-                <th>Delay</th>
-                <th>Channel</th>
-              </tr>
-            </thead>
-            <tbody id="participants-body"></tbody>
-          </table>
-        </div>
       </section>
 
       <section class="panel">

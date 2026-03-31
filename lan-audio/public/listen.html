@@ -23,6 +23,16 @@
       </section>
 
       <section class="panel">
+        <h2>Participants</h2>
+        <p class="small">Everyone can change every participant's delay and channel mode. On this device, direct mode is preferred for stability and host-side processing carries delay and channel changes.</p>
+        <div class="table-wrap">
+          <table class="participant-table">
+            <tbody id="participants-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
         <h2>Signal View</h2>
         <p class="small">Use these meters to confirm that the phone is receiving a remote stream and producing local playback audio.</p>
         <div class="meter-grid">
@@ -40,24 +50,6 @@
             </div>
             <canvas id="playback-meter" class="meter-canvas"></canvas>
           </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <h2>Participants</h2>
-        <p class="small">Everyone can change every participant's delay and channel mode. Your own row changes how this device plays the stream.</p>
-        <div class="table-wrap">
-          <table class="participant-table">
-            <thead>
-              <tr>
-                <th>Participant</th>
-                <th>Role</th>
-                <th>Delay</th>
-                <th>Channel</th>
-              </tr>
-            </thead>
-            <tbody id="participants-body"></tbody>
-          </table>
         </div>
       </section>
 

@@ -6,6 +6,10 @@ const CHANNEL_OPTIONS = [
   { value: 'left', label: 'L' },
   { value: 'right', label: 'R' }
 ]
+const DELAY_MIN_MS = 0
+const DELAY_MAX_MS = 300
+const DELAY_STEP_MS = 5
+const DELAY_BUTTON_STEP_MS = 10
 
 function randomId(prefix) {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`
@@ -22,14 +26,40 @@ function setStatus(element, message, tone) {
 
 function clampDelay(value) {
   const delay = Number(value)
-  if (!Number.isFinite(delay)) return 0
-  return Math.max(0, Math.min(5000, Math.round(delay)))
+  if (!Number.isFinite(delay)) return DELAY_MIN_MS
+  const snapped = Math.round(delay / DELAY_STEP_MS) * DELAY_STEP_MS
+  return Math.max(DELAY_MIN_MS, Math.min(DELAY_MAX_MS, snapped))
 }
 
 function normalizeChannelMode(mode) {
   if (mode === 'mono') return mode
   if (mode === 'left' || mode === 'right') return mode
   return 'stereo'
+}
+
+async function adjustParticipantDelay(participants, targetClientId, delta, applySettings) {
+  const normalizedDelta = clampDelay(Math.abs(delta)) * Math.sign(Number(delta) || 0)
+  if (!normalizedDelta) return
+
+  const target = findParticipant(participants, targetClientId)
+  if (!target) return
+
+  if (normalizedDelta < 0 && target.delayMs <= DELAY_MIN_MS) {
+    const shiftAmount = Math.abs(normalizedDelta)
+    const others = participants.filter(participant => participant.clientId !== targetClientId)
+
+    for (const participant of others) {
+      await applySettings(participant.clientId, {
+        delayMs: clampDelay(participant.delayMs + shiftAmount)
+      })
+    }
+
+    return
+  }
+
+  await applySettings(targetClientId, {
+    delayMs: clampDelay(target.delayMs + normalizedDelta)
+  })
 }
 
 async function postJson(url, payload) {
@@ -338,6 +368,10 @@ function createStreamVisualizer(canvas, valueElement) {
     drawFrame()
   }
 
+  async function prime() {
+    await ensureContext()
+  }
+
   function clear(message) {
     disconnectSource()
     stopLoop()
@@ -378,6 +412,7 @@ function createStreamVisualizer(canvas, valueElement) {
   return {
     attachStream,
     clear,
+    prime,
     resume,
     getLevel() {
       return lastLevel
@@ -392,7 +427,8 @@ async function createProcessedAudioEngine(stream, options) {
     throw new Error('This browser does not support Web Audio processing.')
   }
 
-  const context = new AudioContextClass()
+  const ownsContext = !(options && options.context)
+  const context = ownsContext ? new AudioContextClass() : options.context
   const sourceNode = context.createMediaStreamSource(stream)
   const delayNode = context.createDelay(5)
   const splitter = context.createChannelSplitter(2)
@@ -401,7 +437,15 @@ async function createProcessedAudioEngine(stream, options) {
   const rightToLeftGain = context.createGain()
   const rightToRightGain = context.createGain()
   const merger = context.createChannelMerger(2)
+  const analyser = context.createAnalyser()
   const destination = context.createMediaStreamDestination()
+  const speakerGain = options && options.audibleDestination
+    ? context.createGain()
+    : null
+  const keepAliveGain = options && options.keepAliveDestination
+    ? context.createGain()
+    : null
+  const levelBuffer = new Float32Array(2048)
 
   sourceNode.connect(delayNode)
   delayNode.connect(splitter)
@@ -413,7 +457,24 @@ async function createProcessedAudioEngine(stream, options) {
   leftToRightGain.connect(merger, 0, 1)
   rightToLeftGain.connect(merger, 0, 0)
   rightToRightGain.connect(merger, 0, 1)
+  merger.connect(analyser)
   merger.connect(destination)
+
+  if (speakerGain) {
+    speakerGain.gain.value = 1
+    merger.connect(speakerGain)
+    speakerGain.connect(context.destination)
+  }
+
+  if (keepAliveGain) {
+    // Some mobile browsers only keep the graph rendering when it also feeds
+    // the real device output. Keep this tap effectively silent.
+    keepAliveGain.gain.value = 0.000001
+    merger.connect(keepAliveGain)
+    keepAliveGain.connect(context.destination)
+  }
+
+  analyser.fftSize = 2048
 
   function applyChannelMode(channelMode) {
     const mode = normalizeChannelMode(channelMode)
@@ -449,6 +510,23 @@ async function createProcessedAudioEngine(stream, options) {
   delayNode.delayTime.value = clampDelay(options && options.delayMs) / 1000
   await context.resume()
 
+  function getLevel() {
+    if (context.state !== 'running') {
+      return 0
+    }
+
+    analyser.getFloatTimeDomainData(levelBuffer)
+
+    let sumSquares = 0
+    for (let index = 0; index < levelBuffer.length; index += 1) {
+      const sample = levelBuffer[index]
+      sumSquares += sample * sample
+    }
+
+    const rms = Math.sqrt(sumSquares / levelBuffer.length)
+    return Math.max(0, Math.min(1, rms * 5))
+  }
+
   return {
     context,
     outputStream: destination.stream,
@@ -461,6 +539,7 @@ async function createProcessedAudioEngine(stream, options) {
     setChannelMode(channelMode) {
       applyChannelMode(channelMode)
     },
+    getLevel,
     async close() {
       try {
         sourceNode.disconnect()
@@ -494,7 +573,215 @@ async function createProcessedAudioEngine(stream, options) {
         merger.disconnect()
       } catch (error) {}
 
-      await context.close()
+      try {
+        analyser.disconnect()
+      } catch (error) {}
+
+      if (speakerGain) {
+        try {
+          speakerGain.disconnect()
+        } catch (error) {}
+      }
+
+      if (keepAliveGain) {
+        try {
+          keepAliveGain.disconnect()
+        } catch (error) {}
+      }
+
+      if (ownsContext) {
+        await context.close()
+      }
+    }
+  }
+}
+
+async function createProcessedElementAudioEngine(mediaElement, options) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext
+  if (!AudioContextClass) {
+    throw new Error('This browser does not support Web Audio processing.')
+  }
+
+  if (!mediaElement) {
+    throw new Error('Missing media element for processed playback.')
+  }
+
+  const ownsContext = !(options && options.context)
+  const context = ownsContext ? new AudioContextClass() : options.context
+  let sourceNode = mediaElement.__homeAudioSourceNode || null
+  let sourceNodeContext = mediaElement.__homeAudioSourceNodeContext || null
+
+  if (!sourceNode) {
+    sourceNode = context.createMediaElementSource(mediaElement)
+    mediaElement.__homeAudioSourceNode = sourceNode
+    mediaElement.__homeAudioSourceNodeContext = context
+    sourceNodeContext = context
+  }
+
+  if (sourceNodeContext !== context) {
+    throw new Error('Media element is already attached to a different audio context.')
+  }
+
+  const delayNode = context.createDelay(5)
+  const splitter = context.createChannelSplitter(2)
+  const leftToLeftGain = context.createGain()
+  const leftToRightGain = context.createGain()
+  const rightToLeftGain = context.createGain()
+  const rightToRightGain = context.createGain()
+  const merger = context.createChannelMerger(2)
+  const analyser = context.createAnalyser()
+  const destination = context.createMediaStreamDestination()
+  const speakerGain = options && options.audibleDestination
+    ? context.createGain()
+    : null
+  const keepAliveGain = options && options.keepAliveDestination
+    ? context.createGain()
+    : null
+  const levelBuffer = new Float32Array(2048)
+
+  sourceNode.connect(delayNode)
+  delayNode.connect(splitter)
+  splitter.connect(leftToLeftGain, 0)
+  splitter.connect(leftToRightGain, 0)
+  splitter.connect(rightToLeftGain, 1)
+  splitter.connect(rightToRightGain, 1)
+  leftToLeftGain.connect(merger, 0, 0)
+  leftToRightGain.connect(merger, 0, 1)
+  rightToLeftGain.connect(merger, 0, 0)
+  rightToRightGain.connect(merger, 0, 1)
+  merger.connect(analyser)
+  merger.connect(destination)
+
+  if (speakerGain) {
+    speakerGain.gain.value = 1
+    merger.connect(speakerGain)
+    speakerGain.connect(context.destination)
+  }
+
+  if (keepAliveGain) {
+    keepAliveGain.gain.value = 0.000001
+    merger.connect(keepAliveGain)
+    keepAliveGain.connect(context.destination)
+  }
+
+  analyser.fftSize = 2048
+
+  function applyChannelMode(channelMode) {
+    const mode = normalizeChannelMode(channelMode)
+
+    let leftToLeft = 0
+    let leftToRight = 0
+    let rightToLeft = 0
+    let rightToRight = 0
+
+    if (mode === 'left') {
+      leftToLeft = 1
+      leftToRight = 1
+    } else if (mode === 'right') {
+      rightToLeft = 1
+      rightToRight = 1
+    } else if (mode === 'mono') {
+      leftToLeft = 0.5
+      leftToRight = 0.5
+      rightToLeft = 0.5
+      rightToRight = 0.5
+    } else {
+      leftToLeft = 1
+      rightToRight = 1
+    }
+
+    leftToLeftGain.gain.setValueAtTime(leftToLeft, context.currentTime)
+    leftToRightGain.gain.setValueAtTime(leftToRight, context.currentTime)
+    rightToLeftGain.gain.setValueAtTime(rightToLeft, context.currentTime)
+    rightToRightGain.gain.setValueAtTime(rightToRight, context.currentTime)
+  }
+
+  function getLevel() {
+    if (context.state !== 'running') {
+      return 0
+    }
+
+    analyser.getFloatTimeDomainData(levelBuffer)
+
+    let sumSquares = 0
+    for (let index = 0; index < levelBuffer.length; index += 1) {
+      const sample = levelBuffer[index]
+      sumSquares += sample * sample
+    }
+
+    const rms = Math.sqrt(sumSquares / levelBuffer.length)
+    return Math.max(0, Math.min(1, rms * 5))
+  }
+
+  applyChannelMode(options && options.channelMode)
+  delayNode.delayTime.value = clampDelay(options && options.delayMs) / 1000
+  await context.resume()
+
+  return {
+    context,
+    outputStream: destination.stream,
+    setDelay(delayMs) {
+      delayNode.delayTime.setValueAtTime(
+        clampDelay(delayMs) / 1000,
+        context.currentTime
+      )
+    },
+    setChannelMode(channelMode) {
+      applyChannelMode(channelMode)
+    },
+    getLevel,
+    async close() {
+      try {
+        delayNode.disconnect()
+      } catch (error) {}
+
+      try {
+        splitter.disconnect()
+      } catch (error) {}
+
+      try {
+        leftToLeftGain.disconnect()
+      } catch (error) {}
+
+      try {
+        leftToRightGain.disconnect()
+      } catch (error) {}
+
+      try {
+        rightToLeftGain.disconnect()
+      } catch (error) {}
+
+      try {
+        rightToRightGain.disconnect()
+      } catch (error) {}
+
+      try {
+        merger.disconnect()
+      } catch (error) {}
+
+      try {
+        analyser.disconnect()
+      } catch (error) {}
+
+      if (speakerGain) {
+        try {
+          speakerGain.disconnect()
+        } catch (error) {}
+      }
+
+      if (keepAliveGain) {
+        try {
+          keepAliveGain.disconnect()
+        } catch (error) {}
+      }
+
+      try {
+        sourceNode.disconnect(delayNode)
+      } catch (error) {}
+
+      if (ownsContext) {
+        await context.close()
+      }
     }
   }
 }
@@ -514,7 +801,7 @@ function renderParticipantsTable(tbody, participants, currentClientId, handlers)
   if (!participants.length) {
     const row = document.createElement('tr')
     const cell = document.createElement('td')
-    cell.colSpan = 4
+    cell.colSpan = 3
     cell.className = 'participant-empty'
     cell.textContent = 'No active participants yet.'
     row.appendChild(cell)
@@ -526,12 +813,9 @@ function renderParticipantsTable(tbody, participants, currentClientId, handlers)
     const row = document.createElement('tr')
 
     const nameCell = document.createElement('td')
+    nameCell.className = 'participant-name'
     nameCell.textContent = formatParticipantLabel(participant, currentClientId)
     row.appendChild(nameCell)
-
-    const roleCell = document.createElement('td')
-    roleCell.textContent = participant.role === 'broadcaster' ? 'Host' : 'Listener'
-    row.appendChild(roleCell)
 
     const delayCell = document.createElement('td')
     const delayControls = document.createElement('div')
@@ -540,9 +824,9 @@ function renderParticipantsTable(tbody, participants, currentClientId, handlers)
     const minusButton = document.createElement('button')
     minusButton.type = 'button'
     minusButton.className = 'secondary delay-button'
-    minusButton.textContent = '-10 ms'
+    minusButton.textContent = `-${DELAY_BUTTON_STEP_MS} ms`
     minusButton.addEventListener('click', () => {
-      handlers.onAdjustDelay(participant.clientId, -10)
+      handlers.onAdjustDelay(participant.clientId, -DELAY_BUTTON_STEP_MS)
     })
 
     const delayValue = document.createElement('span')
@@ -552,9 +836,9 @@ function renderParticipantsTable(tbody, participants, currentClientId, handlers)
     const plusButton = document.createElement('button')
     plusButton.type = 'button'
     plusButton.className = 'secondary delay-button'
-    plusButton.textContent = '+10 ms'
+    plusButton.textContent = `+${DELAY_BUTTON_STEP_MS} ms`
     plusButton.addEventListener('click', () => {
-      handlers.onAdjustDelay(participant.clientId, 10)
+      handlers.onAdjustDelay(participant.clientId, DELAY_BUTTON_STEP_MS)
     })
 
     delayControls.append(minusButton, delayValue, plusButton)

@@ -209,53 +209,52 @@ button:disabled {
 
 .table-wrap {
   margin-top: 16px;
-  overflow-x: auto;
+  overflow-x: hidden;
 }
 
 .participant-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 620px;
 }
 
-.participant-table th,
 .participant-table td {
-  padding: 12px 10px;
+  padding: 10px 6px;
   text-align: left;
   border-top: 1px solid var(--line);
   vertical-align: middle;
-}
-
-.participant-table thead th {
-  border-top: 0;
-  color: var(--accent-strong);
-  font-size: 13px;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
 }
 
 .participant-empty {
   color: var(--muted);
 }
 
+.participant-name {
+  width: 1%;
+  white-space: nowrap;
+  font-size: 15px;
+}
+
 .delay-controls {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   flex-wrap: wrap;
 }
 
 .delay-button {
-  padding: 8px 12px;
+  padding: 7px 10px;
+  font-size: 14px;
 }
 
 .delay-value {
-  min-width: 68px;
+  min-width: 52px;
   font-weight: 600;
+  font-size: 14px;
 }
 
 .channel-select {
-  min-width: 120px;
+  min-width: 86px;
+  padding: 9px 12px;
 }
 
 .codebox {
@@ -303,5 +302,33 @@ audio {
   .panel,
   .card {
     border-radius: 18px;
+  }
+
+  .participant-table td {
+    padding: 8px 4px;
+  }
+
+  .participant-name {
+    font-size: 14px;
+  }
+
+  .delay-controls {
+    gap: 4px;
+  }
+
+  .delay-button {
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+
+  .delay-value {
+    min-width: 44px;
+    font-size: 13px;
+  }
+
+  .channel-select {
+    min-width: 78px;
+    padding: 8px 10px;
+    font-size: 14px;
   }
 }
