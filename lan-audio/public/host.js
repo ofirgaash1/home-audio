@@ -19,10 +19,47 @@ const sourceMeterCanvas = document.querySelector('#source-meter')
 const sourceMeterValue = document.querySelector('#source-meter-value')
 const monitorMeterCanvas = document.querySelector('#monitor-meter')
 const monitorMeterValue = document.querySelector('#monitor-meter-value')
+const eqDrawerShell = document.querySelector('#eq-drawer-shell')
+const eqDrawerBackdrop = document.querySelector('#eq-drawer-backdrop')
+const eqDrawerCloseButton = document.querySelector('#eq-drawer-close')
+const eqSavePresetButton = document.querySelector('#eq-save-preset')
+const eqBypassButton = document.querySelector('#eq-bypass')
+const eqResetButton = document.querySelector('#eq-reset')
+const eqPresetSelect = document.querySelector('#eq-preset-select')
+const eqDrawerTitle = document.querySelector('#eq-drawer-title')
+const eqDrawerSubtitle = document.querySelector('#eq-drawer-subtitle')
+const eqDrawerStatus = document.querySelector('#eq-drawer-status')
+const eqUi = document.querySelector('#participant-eq-ui')
 
 const hostId = randomId('host')
 const peers = new Map()
 const listenerProcessors = new Map()
+const EQ_STORAGE_KEY = 'home-audio.host-eq.v2'
+const EQ_PRESETS_STORAGE_KEY = 'home-audio.host-eq.presets.v1'
+const HOST_EQ_STORAGE_SLOT = 'host-monitor'
+const DEFAULT_EQ_STATE = [
+  { type: 'lowshelf12', frequency: 63, gain: 0, Q: 0.7, bypass: false },
+  { type: 'peaking12', frequency: 136, gain: 0, Q: 0.7, bypass: false },
+  { type: 'peaking12', frequency: 294, gain: 0, Q: 0.7, bypass: false },
+  { type: 'peaking12', frequency: 632, gain: 0, Q: 0.7, bypass: false },
+  { type: 'peaking12', frequency: 1363, gain: 0, Q: 0.7, bypass: false },
+  { type: 'peaking12', frequency: 2936, gain: 0, Q: 0.7, bypass: false },
+  { type: 'highshelf12', frequency: 6324, gain: 0, Q: 0.7, bypass: false },
+  { type: 'noop', frequency: 350, gain: 0, Q: 1, bypass: false }
+]
+const BUILTIN_EQ_PRESETS = {
+  Default: DEFAULT_EQ_STATE,
+  '31.3.26': [
+    { type: 'lowshelf12', frequency: 128.95592361951634, gain: -3.2555309734513287, Q: 0.7, bypass: false },
+    { type: 'peaking12', frequency: 58.96004371289738, gain: -4.370575221238937, Q: 0.695010881248892, bypass: false },
+    { type: 'peaking12', frequency: 294, gain: 0, Q: 0.7, bypass: false },
+    { type: 'peaking12', frequency: 508.6293358792846, gain: -3.7334070796460193, Q: 0.7, bypass: false },
+    { type: 'peaking12', frequency: 1363, gain: 0, Q: 0.7, bypass: false },
+    { type: 'peaking12', frequency: 2936, gain: 0, Q: 0.7, bypass: false },
+    { type: 'highshelf12', frequency: 1251.699925647288, gain: 3.5940265486725664, Q: 0.7, bypass: false },
+    { type: 'noop', frequency: 350, gain: 0, Q: 1, bypass: false }
+  ]
+}
 
 let eventSource = null
 let captureStream = null
@@ -36,6 +73,13 @@ let peerTransportStats = {}
 let lastPeerTraffic = {}
 let diagnosticsBusy = false
 let lastDiagnosticsText = ''
+let selectedEqClientId = hostId
+let eqModules = null
+let eqModulesPromise = null
+let eqModuleError = ''
+let activeEqRuntime = null
+let eqStateStore = loadEqStateStore()
+let eqPresetStore = loadEqPresetStore()
 const sourceVisualizer = createStreamVisualizer(sourceMeterCanvas, sourceMeterValue)
 const monitorVisualizer = createStreamVisualizer(monitorMeterCanvas, monitorMeterValue)
 
@@ -50,6 +94,178 @@ function wait(ms) {
   return new Promise(resolve => {
     window.setTimeout(resolve, ms)
   })
+}
+
+function loadEqStateStore() {
+  try {
+    const raw = window.localStorage.getItem(EQ_STORAGE_KEY)
+    if (!raw) return {}
+
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (error) {
+    console.debug('Failed reading saved EQ state:', error)
+    return {}
+  }
+}
+
+function saveEqStateStore() {
+  try {
+    window.localStorage.setItem(EQ_STORAGE_KEY, JSON.stringify(eqStateStore))
+  } catch (error) {
+    console.debug('Failed saving EQ state:', error)
+  }
+}
+
+function loadEqPresetStore() {
+  try {
+    const raw = window.localStorage.getItem(EQ_PRESETS_STORAGE_KEY)
+    if (!raw) return {}
+
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (error) {
+    console.debug('Failed reading saved EQ presets:', error)
+    return {}
+  }
+}
+
+function saveEqPresetStore() {
+  try {
+    window.localStorage.setItem(EQ_PRESETS_STORAGE_KEY, JSON.stringify(eqPresetStore))
+  } catch (error) {
+    console.debug('Failed saving EQ presets:', error)
+  }
+}
+
+function listEqPresetNames() {
+  const names = new Set([
+    ...Object.keys(BUILTIN_EQ_PRESETS),
+    ...Object.keys(eqPresetStore)
+  ])
+  return Array.from(names).sort((a, b) => a.localeCompare(b))
+}
+
+function saveEqPreset(name, state) {
+  const trimmed = String(name || '').trim()
+  const nextState = cloneEqState(state)
+  if (!trimmed || !nextState || Object.prototype.hasOwnProperty.call(BUILTIN_EQ_PRESETS, trimmed)) {
+    return false
+  }
+  eqPresetStore[trimmed] = nextState
+  saveEqPresetStore()
+  return true
+}
+
+function getEqPreset(name) {
+  const trimmed = String(name || '').trim()
+  if (!trimmed) return null
+  if (Object.prototype.hasOwnProperty.call(BUILTIN_EQ_PRESETS, trimmed)) {
+    return cloneEqState(BUILTIN_EQ_PRESETS[trimmed])
+  }
+  return cloneEqState(eqPresetStore[trimmed])
+}
+
+function isBuiltInEqPresetName(name) {
+  return Object.prototype.hasOwnProperty.call(BUILTIN_EQ_PRESETS, String(name || '').trim())
+}
+
+function refreshEqPresetSelect(preferredName) {
+  if (!eqPresetSelect) return
+  const names = listEqPresetNames()
+  const previousValue = preferredName || eqPresetSelect.value
+  eqPresetSelect.textContent = ''
+
+  names.forEach(name => {
+    const option = document.createElement('option')
+    option.value = name
+    option.textContent = name
+    eqPresetSelect.appendChild(option)
+  })
+
+  if (!names.length) {
+    const option = document.createElement('option')
+    option.value = ''
+    option.textContent = 'No presets'
+    eqPresetSelect.appendChild(option)
+  }
+
+  if (names.includes(previousValue)) {
+    eqPresetSelect.value = previousValue
+  } else if (names.includes('Default')) {
+    eqPresetSelect.value = 'Default'
+  } else if (names.length) {
+    eqPresetSelect.value = names[0]
+  } else {
+    eqPresetSelect.value = ''
+  }
+}
+
+function getEqStorageSlot(clientId) {
+  return clientId === hostId ? HOST_EQ_STORAGE_SLOT : `listener:${clientId}`
+}
+
+function getSavedEqState(clientId) {
+  return cloneEqState(eqStateStore[getEqStorageSlot(clientId)]) || cloneEqState(DEFAULT_EQ_STATE)
+}
+
+function persistEqState(clientId, state) {
+  const nextState = cloneEqState(state)
+  if (!nextState) return
+  eqStateStore[getEqStorageSlot(clientId)] = nextState
+  saveEqStateStore()
+}
+
+function clearSavedEqState(clientId) {
+  delete eqStateStore[getEqStorageSlot(clientId)]
+  saveEqStateStore()
+}
+
+function applyEqStateToRuntime(runtime, state) {
+  if (!runtime || !Array.isArray(state)) return
+
+  state.forEach((filterState, index) => {
+    const nextFilter = filterState || {}
+    runtime.setFilterType(index, nextFilter.type || 'noop')
+    runtime.setFilterFrequency(index, Number(nextFilter.frequency) || 350)
+    runtime.setFilterQ(index, Number(nextFilter.Q) || 1)
+    runtime.setFilterGain(index, Number(nextFilter.gain) || 0)
+    runtime.toggleBypass(index, Boolean(nextFilter.bypass))
+  })
+}
+
+function areAllActiveEqFiltersBypassed(runtime) {
+  if (!runtime || !Array.isArray(runtime.spec)) return false
+  const active = runtime.spec.filter(filter => filter && filter.type !== 'noop')
+  if (!active.length) return false
+  return active.every(filter => Boolean(filter.bypass))
+}
+
+async function ensureEqModules() {
+  if (eqModulesPromise) {
+    return eqModulesPromise
+  }
+
+  eqModulesPromise = Promise.all([
+    import('weq8'),
+    import('weq8/ui')
+  ])
+    .then(([runtimeModule]) => {
+      eqModuleError = ''
+      eqModules = {
+        WEQ8Runtime: runtimeModule.WEQ8Runtime
+      }
+      renderEqDrawer()
+      return eqModules
+    })
+    .catch(error => {
+      eqModuleError = normalizeErrorMessage(error)
+      console.error('Failed loading EQ modules:', error)
+      renderEqDrawer()
+      return null
+    })
+
+  return eqModulesPromise
 }
 
 async function postSignalWithRetry(from, to, signal) {
@@ -99,6 +315,140 @@ function updateMonitorDelayLabel() {
   monitorDelayValue.textContent = `${monitorDelayInput.value} ms`
 }
 
+function getParticipantProcessor(clientId) {
+  if (clientId === hostId) {
+    return monitorProcessor
+  }
+
+  return listenerProcessors.get(clientId) || null
+}
+
+function getEqSubtitle(participant) {
+  if (!participant) {
+    return 'Saved locally.'
+  }
+
+  if (participant.clientId === hostId) {
+    return 'Monitor path.'
+  }
+
+  return 'Host outbound path.'
+}
+
+function setEqUiRuntime(runtime) {
+  if (!eqUi) return
+
+  if (!window.customElements || !window.customElements.get('weq8-ui')) {
+    if (Object.prototype.hasOwnProperty.call(eqUi, 'runtime')) {
+      delete eqUi.runtime
+    }
+    return
+  }
+
+  eqUi.runtime = runtime
+}
+
+function detachEqRuntime() {
+  activeEqRuntime = null
+  setEqUiRuntime(null)
+}
+
+function renderEqDrawer() {
+  if (!eqDrawerShell) return
+  refreshEqPresetSelect()
+
+  const participant = findParticipant(participants, selectedEqClientId)
+
+  if (!participant) {
+    detachEqRuntime()
+    eqResetButton.disabled = true
+    if (eqPresetSelect) {
+      eqPresetSelect.disabled = listEqPresetNames().length === 0
+    }
+    if (eqSavePresetButton) {
+      eqSavePresetButton.disabled = true
+    }
+    if (eqBypassButton) {
+      eqBypassButton.disabled = true
+      eqBypassButton.textContent = 'Bypass'
+    }
+    eqDrawerTitle.textContent = 'EQ'
+    eqDrawerSubtitle.textContent = 'Monitor path.'
+    eqDrawerStatus.textContent = audioOnlyStream
+      ? 'Waiting for participant state.'
+      : 'Start first.'
+    return
+  }
+
+  eqDrawerTitle.textContent = `EQ: ${formatParticipantLabel(participant, hostId)}`
+  eqDrawerSubtitle.textContent = getEqSubtitle(participant)
+
+  if (eqModuleError) {
+    detachEqRuntime()
+    eqResetButton.disabled = true
+    if (eqPresetSelect) {
+      eqPresetSelect.disabled = true
+    }
+    if (eqSavePresetButton) {
+      eqSavePresetButton.disabled = true
+    }
+    if (eqBypassButton) {
+      eqBypassButton.disabled = true
+      eqBypassButton.textContent = 'Bypass'
+    }
+    eqDrawerStatus.textContent = `Load failed: ${eqModuleError}`
+    return
+  }
+
+  const processor = getParticipantProcessor(participant.clientId)
+  const runtime = processor && processor.eqRuntime
+
+  if (!runtime) {
+    detachEqRuntime()
+    eqResetButton.disabled = true
+    if (eqPresetSelect) {
+      eqPresetSelect.disabled = listEqPresetNames().length === 0
+    }
+    if (eqSavePresetButton) {
+      eqSavePresetButton.disabled = true
+    }
+    if (eqBypassButton) {
+      eqBypassButton.disabled = true
+      eqBypassButton.textContent = 'Bypass'
+    }
+    eqDrawerStatus.textContent = audioOnlyStream
+      ? 'Waiting for audio.'
+      : 'Start first.'
+    return
+  }
+
+  activeEqRuntime = runtime
+  setEqUiRuntime(runtime)
+  eqResetButton.disabled = false
+  if (eqPresetSelect) {
+    eqPresetSelect.disabled = listEqPresetNames().length === 0
+  }
+  if (eqSavePresetButton) {
+    eqSavePresetButton.disabled = false
+  }
+  if (eqBypassButton) {
+    eqBypassButton.disabled = false
+    eqBypassButton.textContent = areAllActiveEqFiltersBypassed(runtime) ? 'Unbypass' : 'Bypass'
+  }
+  eqDrawerStatus.textContent = 'Live. Saved locally.'
+}
+
+function openEqDrawer(clientId) {
+  selectedEqClientId = clientId
+  renderEqDrawer()
+  ensureEqModules().catch(() => {})
+}
+
+function closeEqDrawer() {
+  selectedEqClientId = hostId
+  renderEqDrawer()
+}
+
 function summarizeTrack(track) {
   if (!track) return 'none'
   return `${track.kind}:${track.readyState}${track.enabled ? ':enabled' : ':disabled'}`
@@ -127,6 +477,7 @@ function summarizePeer(listenerId, peer) {
     `${listenerId}:`,
     `  outboundDelayMs=${outboundDelay}`,
     `  outboundChannelMode=${outboundMode}`,
+    `  outboundEqRuntime=${outboundProcessor && outboundProcessor.eqRuntime ? 'ready' : 'off'}`,
     `  outboundProcessorLevel=${outboundProcessor && typeof outboundProcessor.getLevel === 'function'
       ? outboundProcessor.getLevel().toFixed(4)
       : 'n/a'}`,
@@ -476,6 +827,9 @@ function renderParticipants() {
       }).catch(error => {
         setStatus(statusBox, error.message, 'warn')
       })
+    },
+    onOpenEq(targetClientId) {
+      openEqDrawer(targetClientId)
     }
   })
 
@@ -515,6 +869,7 @@ function updateParticipants(nextParticipants) {
   syncSelfDelayControl()
   applySelfAudioSettings()
   syncListenerOutboundSettings()
+  renderEqDrawer()
   renderDiagnostics()
   renderRemoteDiagnostics()
 }
@@ -570,6 +925,16 @@ async function updateParticipantSettings(targetClientId, settings) {
   updateParticipants(response.participants)
 }
 
+function attachEqPersistence(clientId, processor) {
+  if (!processor || !processor.eqRuntime || typeof processor.eqRuntime.on !== 'function') {
+    return
+  }
+
+  processor.eqUnsubscribe = processor.eqRuntime.on('filtersChanged', state => {
+    persistEqState(clientId, state)
+  })
+}
+
 async function setMonitorOutputDevice() {
   if (!monitorPlayer.srcObject) return
   if (!monitorDeviceSelect.value) return
@@ -583,6 +948,7 @@ async function setMonitorOutputDevice() {
 
 async function startLocalMonitor() {
   stopLocalMonitor()
+  await ensureEqModules()
 
   const selfParticipant = getSelfParticipant() || {
     delayMs: 0,
@@ -591,13 +957,17 @@ async function startLocalMonitor() {
 
   monitorProcessor = await createProcessedAudioEngine(audioOnlyStream, {
     delayMs: selfParticipant.delayMs,
-    channelMode: selfParticipant.channelMode
+    channelMode: selfParticipant.channelMode,
+    eqRuntimeClass: eqModules && eqModules.WEQ8Runtime,
+    eqState: getSavedEqState(hostId)
   })
 
+  attachEqPersistence(hostId, monitorProcessor)
   monitorPlayer.srcObject = monitorProcessor.outputStream
   await monitorVisualizer.attachStream(monitorProcessor.outputStream)
   await setMonitorOutputDevice()
   await monitorPlayer.play()
+  renderEqDrawer()
 }
 
 function stopLocalMonitor() {
@@ -605,11 +975,15 @@ function stopLocalMonitor() {
   monitorPlayer.srcObject = null
 
   if (monitorProcessor) {
+    if (typeof monitorProcessor.eqUnsubscribe === 'function') {
+      monitorProcessor.eqUnsubscribe()
+    }
     monitorProcessor.close().catch(() => {})
   }
 
   monitorProcessor = null
   monitorVisualizer.clear('Waiting for audio')
+  renderEqDrawer()
 }
 
 function destroyPeer(clientId) {
@@ -619,16 +993,21 @@ function destroyPeer(clientId) {
   peer.destroy()
   const processor = listenerProcessors.get(clientId)
   if (processor) {
+    if (typeof processor.eqUnsubscribe === 'function') {
+      processor.eqUnsubscribe()
+    }
     processor.close().catch(() => {})
     listenerProcessors.delete(clientId)
   }
   delete peerTransportStats[clientId]
   delete lastPeerTraffic[clientId]
+  renderEqDrawer()
 }
 
 async function createPeer(listenerId) {
   const existingPeer = peers.get(listenerId)
   if (existingPeer) return existingPeer
+  await ensureEqModules()
 
   const listenerParticipant = findParticipant(participants, listenerId) || {
     delayMs: 0,
@@ -637,9 +1016,12 @@ async function createPeer(listenerId) {
   const outboundProcessor = await createProcessedAudioEngine(audioOnlyStream, {
     delayMs: listenerParticipant.delayMs,
     channelMode: listenerParticipant.channelMode,
-    keepAliveDestination: true
+    keepAliveDestination: true,
+    eqRuntimeClass: eqModules && eqModules.WEQ8Runtime,
+    eqState: getSavedEqState(listenerId)
   })
   const outboundStream = outboundProcessor.outputStream
+  attachEqPersistence(listenerId, outboundProcessor)
 
   const peer = new SimplePeer({
     initiator: true,
@@ -656,7 +1038,7 @@ async function createPeer(listenerId) {
   })
 
   peer.on('connect', () => {
-    setStatus(statusBox, `Broadcast live. Active participants: ${participants.length}`)
+    setStatus(statusBox, `Live: ${participants.length}`)
     renderDiagnostics()
   })
 
@@ -664,9 +1046,13 @@ async function createPeer(listenerId) {
     peers.delete(listenerId)
     const processor = listenerProcessors.get(listenerId)
     if (processor) {
+      if (typeof processor.eqUnsubscribe === 'function') {
+        processor.eqUnsubscribe()
+      }
       processor.close().catch(() => {})
       listenerProcessors.delete(listenerId)
     }
+    renderEqDrawer()
     renderDiagnostics()
   })
 
@@ -688,6 +1074,7 @@ async function createPeer(listenerId) {
 
   peers.set(listenerId, peer)
   listenerProcessors.set(listenerId, outboundProcessor)
+  renderEqDrawer()
   renderDiagnostics()
 
   return peer
@@ -698,7 +1085,7 @@ async function startBroadcast() {
   await refreshMediaDevices({ primeLabels: true })
 
   if (!sourceDeviceSelect.value) {
-    throw new Error('Select the VB-CABLE source device first.')
+    throw new Error('Select source.')
   }
 
   captureStream = await navigator.mediaDevices.getUserMedia({
@@ -745,7 +1132,7 @@ async function startBroadcast() {
 
   startButton.disabled = true
   stopButton.disabled = false
-  setStatus(statusBox, 'Broadcast started. Everyone can now tune delay and channel mode from the participant table.')
+  setStatus(statusBox, 'Live')
 
   for (const listenerId of registration.listeners) {
     await createPeer(listenerId)
@@ -779,7 +1166,7 @@ async function stopBroadcast() {
   updateParticipants([])
   startButton.disabled = false
   stopButton.disabled = true
-  setStatus(statusBox, 'Broadcast stopped.')
+  setStatus(statusBox, 'Idle')
   stopping = false
   renderDiagnostics()
 }
@@ -799,7 +1186,7 @@ function requestSelfDelayChange(delayMs) {
 
 startButton.addEventListener('click', async () => {
   startButton.disabled = true
-  setStatus(statusBox, 'Opening the selected audio device...')
+  setStatus(statusBox, 'Opening...')
 
   try {
     await startBroadcast()
@@ -838,6 +1225,88 @@ monitorDeviceSelect.addEventListener('change', () => {
   })
 })
 
+if (eqDrawerBackdrop) {
+  eqDrawerBackdrop.addEventListener('click', () => {
+    closeEqDrawer()
+  })
+}
+
+if (eqDrawerCloseButton) {
+  eqDrawerCloseButton.addEventListener('click', () => {
+    closeEqDrawer()
+  })
+}
+
+eqResetButton.addEventListener('click', () => {
+  if (!selectedEqClientId || !activeEqRuntime) return
+  clearSavedEqState(selectedEqClientId)
+  applyEqStateToRuntime(activeEqRuntime, cloneEqState(DEFAULT_EQ_STATE))
+  persistEqState(selectedEqClientId, DEFAULT_EQ_STATE)
+  if (eqBypassButton) {
+    eqBypassButton.textContent = 'Bypass'
+  }
+  eqDrawerStatus.textContent = 'Reset.'
+})
+
+if (eqSavePresetButton) {
+  eqSavePresetButton.addEventListener('click', () => {
+    if (!activeEqRuntime) return
+
+    const selectedName = String(eqPresetSelect && eqPresetSelect.value ? eqPresetSelect.value : '').trim()
+    const nameToSave = selectedName && !isBuiltInEqPresetName(selectedName)
+      ? selectedName
+      : `Preset ${new Date().toISOString().slice(0, 19).replace('T', ' ')}`
+
+    if (!saveEqPreset(nameToSave, activeEqRuntime.spec)) {
+      eqDrawerStatus.textContent = 'Save failed.'
+      return
+    }
+
+    refreshEqPresetSelect(nameToSave)
+    eqDrawerStatus.textContent = `Preset saved: ${nameToSave}.`
+  })
+}
+
+if (eqPresetSelect) {
+  eqPresetSelect.addEventListener('change', () => {
+    if (!selectedEqClientId || !activeEqRuntime) return
+
+    const selectedName = String(eqPresetSelect.value || '').trim()
+    if (!selectedName) {
+      eqDrawerStatus.textContent = 'No presets saved.'
+      return
+    }
+
+    const presetState = getEqPreset(selectedName)
+    if (!presetState) {
+      eqDrawerStatus.textContent = 'Preset not found.'
+      return
+    }
+
+    applyEqStateToRuntime(activeEqRuntime, presetState)
+    persistEqState(selectedEqClientId, presetState)
+    if (eqBypassButton) {
+      eqBypassButton.textContent = areAllActiveEqFiltersBypassed(activeEqRuntime) ? 'Unbypass' : 'Bypass'
+    }
+    eqDrawerStatus.textContent = `Preset loaded: ${selectedName}.`
+  })
+}
+
+if (eqBypassButton) {
+  eqBypassButton.addEventListener('click', () => {
+    if (!selectedEqClientId || !activeEqRuntime) return
+
+    const nextBypass = !areAllActiveEqFiltersBypassed(activeEqRuntime)
+    activeEqRuntime.spec.forEach((filter, index) => {
+      if (!filter || filter.type === 'noop') return
+      activeEqRuntime.toggleBypass(index, nextBypass)
+    })
+    persistEqState(selectedEqClientId, activeEqRuntime.spec)
+    eqBypassButton.textContent = nextBypass ? 'Unbypass' : 'Bypass'
+    eqDrawerStatus.textContent = nextBypass ? 'Bypassed.' : 'Active.'
+  })
+}
+
 presetButtons.forEach(button => {
   button.addEventListener('click', () => {
     requestSelfDelayChange(button.dataset.delay)
@@ -846,6 +1315,7 @@ presetButtons.forEach(button => {
 
 window.addEventListener('beforeunload', () => {
   if (eventSource) eventSource.close()
+  closeEqDrawer()
   stopLocalMonitor()
   sourceVisualizer.close().catch(() => {})
   monitorVisualizer.close().catch(() => {})
@@ -858,6 +1328,7 @@ updateMonitorDelayLabel()
 renderParticipants()
 startDiagnostics()
 renderRemoteDiagnostics()
+renderEqDrawer()
 
 fetchStatus()
   .then(renderLinks)
@@ -877,3 +1348,5 @@ if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener ===
     refreshMediaDevices().catch(() => {})
   })
 }
+
+ensureEqModules().catch(() => {})

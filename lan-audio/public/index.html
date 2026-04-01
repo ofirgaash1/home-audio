@@ -9,24 +9,16 @@
   <body>
     <main class="shell">
       <section class="hero">
-        <div class="eyebrow">Same Wi-Fi Audio Relay</div>
-        <h1>Send your PC sound to your phone v2.</h1>
-        <p class="lead">
-          Open the host page on the PC in Chrome or Edge, route audio into VB-CABLE, and then open the listener page on your phone.
-        </p>
+        <div class="eyebrow">Home Audio</div>
+        <h1>Open</h1>
         <div class="button-row">
-          <a class="button" href="/host">Open PC Host</a>
-          <a class="button secondary" href="/listen">Open Phone Listener</a>
+          <a class="button" href="/host">Host</a>
+          <a class="button secondary" href="/listen">Listen</a>
         </div>
       </section>
 
       <section class="panel">
-        <h2>How it works</h2>
-        <div class="steps">
-          <p>1. Run <code>npm run lan-audio</code> on this PC.</p>
-          <p>2. On the PC, open <code>http://localhost:43117/host</code>.</p>
-          <p>3. Route the app audio you want into <code>CABLE Input</code>, then open one of the listener URLs shown below on the phone.</p>
-        </div>
+        <h2>URLs</h2>
         <div class="links" id="listen-links"></div>
       </section>
     </main>
@@ -38,7 +30,7 @@
       fetchStatus()
         .then(status => {
           if (!status.listenPages.length) {
-            links.innerHTML = '<p class="small">No LAN IP detected yet. Check that the PC is connected to Wi-Fi.</p>'
+            links.innerHTML = '<p class="small">No URLs</p>'
             return
           }
 
@@ -47,7 +39,7 @@
             .join('')
         })
         .catch(error => {
-          links.innerHTML = `<p class="small">${error.message}</p>`
+          links.innerHTML = '<p class="small">Unavailable</p>'
         })
     </script>
   </body>

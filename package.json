@@ -5,6 +5,13 @@
   "private": true,
   "license": "MIT",
   "scripts": {
-    "lan-audio": "node lan-audio/server.js"
+    "lan-audio": "node lan-audio/server.js",
+    "test:eq-ui": "node lan-audio/ui-tests/eq-drag-host.mjs"
+  },
+  "dependencies": {
+    "weq8": "^0.2.2"
+  },
+  "devDependencies": {
+    "playwright": "^1.58.2"
   }
 }

@@ -27,9 +27,9 @@ body {
 }
 
 .shell {
-  width: min(920px, calc(100% - 32px));
+  width: min(1040px, calc(100% - 24px));
   margin: 0 auto;
-  padding: 32px 0 56px;
+  padding: 20px 0 32px;
 }
 
 .hero,
@@ -42,13 +42,13 @@ body {
 }
 
 .hero {
-  padding: 28px;
-  margin-bottom: 20px;
+  padding: 22px;
+  margin-bottom: 14px;
 }
 
 .panel {
-  padding: 24px;
-  margin-top: 20px;
+  padding: 18px;
+  margin-top: 14px;
 }
 
 .eyebrow {
@@ -70,13 +70,13 @@ h2 {
 }
 
 h1 {
-  font-size: clamp(34px, 6vw, 64px);
-  line-height: 0.98;
-  max-width: 10ch;
+  font-size: clamp(28px, 5vw, 42px);
+  line-height: 1;
+  max-width: none;
 }
 
 h2 {
-  font-size: 28px;
+  font-size: 22px;
 }
 
 p {
@@ -92,13 +92,13 @@ p {
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 18px;
-  margin-top: 22px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
 }
 
 .card {
-  padding: 20px;
+  padding: 14px;
   border-radius: 18px;
   border: 1px solid var(--line);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.8), rgba(247, 241, 228, 0.9));
@@ -107,8 +107,8 @@ p {
 .button-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 20px;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 .button,
@@ -117,12 +117,14 @@ select {
   appearance: none;
   border: 0;
   border-radius: 999px;
-  padding: 13px 18px;
+  min-width: 0;
+  padding: 11px 14px;
   font: inherit;
 }
 
 .button,
 button {
+  flex: 0 1 auto;
   background: var(--accent);
   color: #fff;
   cursor: pointer;
@@ -142,7 +144,9 @@ button:hover {
 }
 
 select {
-  min-width: 220px;
+  flex: 1 1 220px;
+  width: 100%;
+  min-width: 0;
   background: #fff;
   color: var(--text);
   border: 1px solid var(--line);
@@ -159,9 +163,13 @@ button:disabled {
   margin-top: 12px;
 }
 
+.preset-row button {
+  flex: 1 1 120px;
+}
+
 .status {
-  margin-top: 16px;
-  padding: 14px 16px;
+  margin-top: 12px;
+  padding: 12px 14px;
   border-radius: 16px;
   background: var(--panel-strong);
   color: var(--muted);
@@ -181,15 +189,16 @@ button:disabled {
 .meter-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 16px;
-  margin-top: 16px;
+  gap: 12px;
+  margin-top: 12px;
 }
 
 .meter-card {
-  padding: 16px;
+  padding: 14px;
   border-radius: 18px;
   border: 1px solid var(--line);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(247, 241, 228, 0.88));
+  overflow: auto;
 }
 
 .meter-heading {
@@ -208,17 +217,18 @@ button:disabled {
 }
 
 .table-wrap {
-  margin-top: 16px;
-  overflow-x: hidden;
+  margin-top: 10px;
+  overflow: visible;
 }
 
 .participant-table {
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
 }
 
 .participant-table td {
-  padding: 10px 6px;
+  padding: 8px 6px;
   text-align: left;
   border-top: 1px solid var(--line);
   vertical-align: middle;
@@ -229,8 +239,9 @@ button:disabled {
 }
 
 .participant-name {
-  width: 1%;
-  white-space: nowrap;
+  width: 28%;
+  white-space: normal;
+  overflow-wrap: anywhere;
   font-size: 15px;
 }
 
@@ -242,19 +253,123 @@ button:disabled {
 }
 
 .delay-button {
-  padding: 7px 10px;
+  padding: 7px 9px;
   font-size: 14px;
 }
 
 .delay-value {
-  min-width: 52px;
+  min-width: 44px;
   font-weight: 600;
   font-size: 14px;
 }
 
 .channel-select {
-  min-width: 86px;
+  min-width: 0;
   padding: 9px 12px;
+}
+
+.participant-actions {
+  width: 72px;
+  white-space: normal;
+  text-align: right;
+}
+
+.participant-action-button {
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 14px;
+}
+
+.drawer-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+
+.drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  border-radius: 0;
+  background: rgba(27, 24, 20, 0.42);
+}
+
+.drawer-backdrop:hover {
+  transform: none;
+}
+
+.drawer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  padding: 18px;
+  background: #555;
+  overflow: auto;
+}
+
+.drawer-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  max-width: 980px;
+  width: 100%;
+  margin: 0 auto;
+  color: #fff;
+}
+
+.drawer-eyebrow {
+  margin-bottom: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.drawer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.eq-inline-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.eq-preset-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 420px);
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.eq-preset-controls input,
+.eq-preset-controls select {
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--text);
+  padding: 10px 14px;
+  font: inherit;
+}
+
+.drawer-status {
+  margin-top: 8px;
+  color: var(--muted);
+}
+
+.drawer-body {
+  margin-top: 12px;
+  width: 100%;
+}
+
+weq8-ui {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
 }
 
 .codebox {
@@ -268,6 +383,8 @@ button:disabled {
 }
 
 .diagnostics-box {
+  max-height: 38vh;
+  overflow: auto;
   white-space: pre-wrap;
   line-height: 1.45;
 }
@@ -279,7 +396,7 @@ button:disabled {
 
 audio {
   width: 100%;
-  margin-top: 18px;
+  margin-top: 12px;
 }
 
 .badge {
@@ -294,8 +411,8 @@ audio {
 
 @media (max-width: 640px) {
   .shell {
-    width: min(100% - 20px, 920px);
-    padding-top: 18px;
+    width: min(100% - 12px, 920px);
+    padding-top: 10px;
   }
 
   .hero,
@@ -304,11 +421,45 @@ audio {
     border-radius: 18px;
   }
 
-  .participant-table td {
-    padding: 8px 4px;
+  .hero {
+    padding: 16px;
   }
 
-  .participant-name {
+  .panel {
+    padding: 14px;
+  }
+
+  .button,
+  button,
+  select {
+    width: 100%;
+  }
+
+  .button-row > * {
+    flex: 1 1 100%;
+  }
+
+  .participant-table,
+  .participant-table tbody,
+  .participant-table tr,
+  .participant-table td {
+    display: block;
+  }
+
+  .participant-table tr {
+    padding: 8px 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .participant-table td {
+    padding: 4px 0;
+    border-top: 0;
+  }
+
+  .participant-name,
+  .participant-actions {
+    width: auto;
+    text-align: left;
     font-size: 14px;
   }
 
@@ -327,8 +478,37 @@ audio {
   }
 
   .channel-select {
-    min-width: 78px;
     padding: 8px 10px;
     font-size: 14px;
+  }
+
+  .participant-action-button {
+    width: auto;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+
+  .drawer {
+    padding: 14px;
+  }
+
+  .drawer-head {
+    flex-direction: column;
+  }
+
+  .drawer-actions {
+    width: 100%;
+  }
+
+  .drawer-actions button {
+    flex: 1 1 120px;
+  }
+
+  .eq-preset-controls {
+    grid-template-columns: 1fr;
+  }
+
+  weq8-ui {
+    max-width: 100%;
   }
 }

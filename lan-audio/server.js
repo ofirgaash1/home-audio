@@ -9,6 +9,8 @@ const { URL } = require('url')
 const PORT = Number(process.env.PORT || 43117)
 const HOST = process.env.HOST || '0.0.0.0'
 const PUBLIC_DIR = path.join(__dirname, 'public')
+const NODE_MODULES_DIR = path.join(__dirname, '..', 'node_modules')
+const LOCAL_WEQ8_DIST_DIR = path.join(__dirname, 'weq8-main', 'dist')
 const SIMPLE_PEER_PATH = path.join(__dirname, '..', 'simplepeer.min.js')
 const DEBUG_LOG_PATH = path.resolve(
   process.env.HOME_AUDIO_DEBUG_LOG || path.join(os.tmpdir(), 'home-audio', 'debug.ndjson')
@@ -752,6 +754,36 @@ function createServer() {
 
       if (req.method === 'GET' && parsedUrl.pathname === '/simplepeer.min.js') {
         serveFile(res, SIMPLE_PEER_PATH)
+        return
+      }
+
+      if (req.method === 'GET' && parsedUrl.pathname.startsWith('/vendor/weq8-local/')) {
+        const filePath = parsedUrl.pathname.slice('/vendor/weq8-local/'.length)
+        const resolvedPath = path.join(LOCAL_WEQ8_DIST_DIR, filePath)
+        const normalizedLocalWeq8Dir = path.resolve(LOCAL_WEQ8_DIST_DIR)
+        const normalizedResolvedPath = path.resolve(resolvedPath)
+
+        if (!normalizedResolvedPath.startsWith(normalizedLocalWeq8Dir)) {
+          sendJson(res, 403, { error: 'Forbidden' })
+          return
+        }
+
+        serveFile(res, normalizedResolvedPath)
+        return
+      }
+
+      if (req.method === 'GET' && parsedUrl.pathname.startsWith('/vendor/npm/')) {
+        const filePath = parsedUrl.pathname.slice('/vendor/npm/'.length)
+        const resolvedPath = path.join(NODE_MODULES_DIR, filePath)
+        const normalizedNodeModulesDir = path.resolve(NODE_MODULES_DIR)
+        const normalizedResolvedPath = path.resolve(resolvedPath)
+
+        if (!normalizedResolvedPath.startsWith(normalizedNodeModulesDir)) {
+          sendJson(res, 403, { error: 'Forbidden' })
+          return
+        }
+
+        serveFile(res, normalizedResolvedPath)
         return
       }
 

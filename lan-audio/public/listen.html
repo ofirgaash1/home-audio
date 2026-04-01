@@ -9,22 +9,18 @@
   <body>
     <main class="shell">
       <section class="hero">
-        <div class="eyebrow">Phone Listener</div>
-        <h1>Listen to the PC from this device v2.</h1>
-        <p class="lead">
-          Tap once to allow audio playback, then keep this page open. Headphones help if the phone speaker feeds back into the PC microphone nearby.
-        </p>
+        <div class="eyebrow">Listener</div>
+        <h1>Listen</h1>
         <div class="button-row">
-          <button id="join">Join Audio</button>
+          <button id="join">Join</button>
           <button id="leave" class="secondary" disabled>Leave</button>
         </div>
-        <div class="status" id="status">Ready to join.</div>
+        <div class="status" id="status">Idle</div>
         <audio id="player" controls autoplay playsinline></audio>
       </section>
 
       <section class="panel">
         <h2>Participants</h2>
-        <p class="small">Everyone can change every participant's delay and channel mode. On this device, direct mode is preferred for stability and host-side processing carries delay and channel changes.</p>
         <div class="table-wrap">
           <table class="participant-table">
             <tbody id="participants-body"></tbody>
@@ -33,19 +29,18 @@
       </section>
 
       <section class="panel">
-        <h2>Signal View</h2>
-        <p class="small">Use these meters to confirm that the phone is receiving a remote stream and producing local playback audio.</p>
+        <h2>Meters</h2>
         <div class="meter-grid">
           <div class="meter-card">
             <div class="meter-heading">
-              <span>Incoming Stream</span>
+              <span>In</span>
               <span class="small" id="incoming-meter-value">Waiting for audio</span>
             </div>
             <canvas id="incoming-meter" class="meter-canvas"></canvas>
           </div>
           <div class="meter-card">
             <div class="meter-heading">
-              <span>Playback Output</span>
+              <span>Out</span>
               <span class="small" id="playback-meter-value">Waiting for audio</span>
             </div>
             <canvas id="playback-meter" class="meter-canvas"></canvas>
@@ -54,18 +49,8 @@
       </section>
 
       <section class="panel">
-        <h2>Diagnostics</h2>
-        <p class="small">Use this to verify whether the phone has received an audio track, receiver, or stream.</p>
+        <h2>Debug</h2>
         <pre class="codebox diagnostics-box" id="diagnostics">Loading diagnostics...</pre>
-      </section>
-
-      <section class="panel">
-        <h2>What to expect</h2>
-        <div class="steps">
-          <p>1. Join from the phone after the PC page is open.</p>
-          <p>2. Wait a few seconds for the direct audio link to finish connecting.</p>
-          <p>3. If background playback stops after switching apps, reopen the page and press play again. The page will try to keep audio alive, but the phone browser still decides the final behavior.</p>
-        </div>
       </section>
     </main>
 

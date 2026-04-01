@@ -691,10 +691,10 @@ async function startPlayback(stream, sessionId) {
     await playbackProcessor.context.resume()
     assertCurrentPlaybackSession(sessionId)
     mediaReady = true
-    setStatus(statusBox, 'Audio is playing.')
+    setStatus(statusBox, 'Playing')
     renderDiagnostics()
   } catch (error) {
-    setStatus(statusBox, 'Tap the audio control if playback stays paused.', 'warn')
+    setStatus(statusBox, 'Tap play.', 'warn')
     renderDiagnostics()
   }
 }
@@ -718,22 +718,10 @@ async function startDirectPlaybackFallback(stream, reason, sessionId) {
     await player.play()
     assertCurrentPlaybackSession(sessionId)
     mediaReady = true
-    setStatus(
-      statusBox,
-      preferredDirectMode
-        ? `Audio is playing in direct mode on this device. Delay/channel controls are applied upstream when available. ${reason || ''}`.trim()
-        : `Audio is playing with direct fallback on this device. Delay/channel controls are applied upstream when available. ${reason || ''}`.trim(),
-      preferredDirectMode ? null : 'warn'
-    )
+    setStatus(statusBox, preferredDirectMode ? 'Direct' : 'Fallback', preferredDirectMode ? null : 'warn')
     renderDiagnostics()
   } catch (error) {
-    setStatus(
-      statusBox,
-      preferredDirectMode
-        ? 'Tap the audio control to start direct playback on this device.'
-        : 'Tap the audio control to start playback. This phone rejected the processed audio path, so direct playback fallback is loaded.',
-      'warn'
-    )
+    setStatus(statusBox, 'Tap play.', 'warn')
     renderDiagnostics()
   }
 }
@@ -757,7 +745,7 @@ async function handleIncomingMediaStream(stream, sourceLabel) {
       if (shouldPreferDirectPlayback()) {
         await startDirectPlaybackFallback(
           stream,
-          'This device uses direct playback for stability. Delay/channel controls are applied upstream.',
+          'Direct mode.',
           sessionId
         )
         return
@@ -773,7 +761,7 @@ async function handleIncomingMediaStream(stream, sourceLabel) {
       console.error(error)
       await startDirectPlaybackFallback(
         stream,
-        `${sourceLabel || 'Processed playback'} failed on this device/browser. ${describePlaybackFailure(error)}`,
+        describePlaybackFailure(error),
         sessionId
       )
     }
@@ -840,7 +828,7 @@ function ensureEventSource() {
     joined = false
     lastDiagnosticsText = ''
     updateParticipants([])
-    setStatus(statusBox, 'The PC host stopped broadcasting. Leave this page open or tap Join Audio again after the host restarts.', 'warn')
+    setStatus(statusBox, 'Host left', 'warn')
     renderDiagnostics()
   })
 
@@ -885,7 +873,7 @@ function createPeer(hostClientId) {
 
   nextPeer.on('connect', () => {
     if (!mediaReady) {
-      setStatus(statusBox, 'Connected. Waiting for audio packets...')
+      setStatus(statusBox, 'Connected')
     }
     renderDiagnostics()
 
@@ -914,7 +902,7 @@ function createPeer(hostClientId) {
     if (peer === nextPeer) {
       peer = null
     }
-    setStatus(statusBox, 'The audio link failed. Tap Leave and Join Audio to reconnect.', 'warn')
+    setStatus(statusBox, 'Link failed', 'warn')
     renderDiagnostics()
   })
 
@@ -937,7 +925,7 @@ async function joinAudio() {
   joinButton.disabled = true
   leaveButton.disabled = false
   joined = true
-  setStatus(statusBox, 'Joined. Waiting for the PC host offer...')
+  setStatus(statusBox, 'Joined')
   await requestWakeLock()
   renderDiagnostics()
   await pushDiagnostics()
@@ -961,13 +949,13 @@ async function leaveAudio() {
   updateParticipants([])
   joinButton.disabled = false
   leaveButton.disabled = true
-  setStatus(statusBox, 'Disconnected.')
+  setStatus(statusBox, 'Idle')
   renderDiagnostics()
 }
 
 joinButton.addEventListener('click', async () => {
   joinButton.disabled = true
-  setStatus(statusBox, 'Joining...')
+  setStatus(statusBox, 'Joining')
 
   try {
     await primeAudioContexts()

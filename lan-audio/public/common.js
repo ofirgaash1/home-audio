@@ -37,6 +37,16 @@ function normalizeChannelMode(mode) {
   return 'stereo'
 }
 
+function cloneEqState(state) {
+  if (!Array.isArray(state)) return null
+
+  try {
+    return JSON.parse(JSON.stringify(state))
+  } catch (error) {
+    return null
+  }
+}
+
 async function adjustParticipantDelay(participants, targetClientId, delta, applySettings) {
   const normalizedDelta = clampDelay(Math.abs(delta)) * Math.sign(Number(delta) || 0)
   if (!normalizedDelta) return
@@ -431,6 +441,10 @@ async function createProcessedAudioEngine(stream, options) {
   const context = ownsContext ? new AudioContextClass() : options.context
   const sourceNode = context.createMediaStreamSource(stream)
   const delayNode = context.createDelay(5)
+  const WEQ8Runtime = options && options.eqRuntimeClass
+  const eqRuntime = WEQ8Runtime
+    ? new WEQ8Runtime(context, cloneEqState(options && options.eqState) || undefined)
+    : null
   const splitter = context.createChannelSplitter(2)
   const leftToLeftGain = context.createGain()
   const leftToRightGain = context.createGain()
@@ -448,7 +462,14 @@ async function createProcessedAudioEngine(stream, options) {
   const levelBuffer = new Float32Array(2048)
 
   sourceNode.connect(delayNode)
-  delayNode.connect(splitter)
+
+  if (eqRuntime) {
+    delayNode.connect(eqRuntime.input)
+    eqRuntime.connect(splitter)
+  } else {
+    delayNode.connect(splitter)
+  }
+
   splitter.connect(leftToLeftGain, 0)
   splitter.connect(leftToRightGain, 0)
   splitter.connect(rightToLeftGain, 1)
@@ -529,6 +550,7 @@ async function createProcessedAudioEngine(stream, options) {
 
   return {
     context,
+    eqRuntime,
     outputStream: destination.stream,
     setDelay(delayMs) {
       delayNode.delayTime.setValueAtTime(
@@ -548,6 +570,16 @@ async function createProcessedAudioEngine(stream, options) {
       try {
         delayNode.disconnect()
       } catch (error) {}
+
+      if (eqRuntime) {
+        try {
+          eqRuntime.input.disconnect()
+        } catch (error) {}
+
+        try {
+          eqRuntime.disconnect()
+        } catch (error) {}
+      }
 
       try {
         splitter.disconnect()
@@ -796,12 +828,13 @@ function formatParticipantLabel(participant, currentClientId) {
 }
 
 function renderParticipantsTable(tbody, participants, currentClientId, handlers) {
+  const includeEqAction = Boolean(handlers && typeof handlers.onOpenEq === 'function')
   tbody.textContent = ''
 
   if (!participants.length) {
     const row = document.createElement('tr')
     const cell = document.createElement('td')
-    cell.colSpan = 3
+    cell.colSpan = includeEqAction ? 4 : 3
     cell.className = 'participant-empty'
     cell.textContent = 'No active participants yet.'
     row.appendChild(cell)
@@ -863,6 +896,22 @@ function renderParticipantsTable(tbody, participants, currentClientId, handlers)
 
     channelCell.appendChild(channelSelect)
     row.appendChild(channelCell)
+
+    if (includeEqAction) {
+      const actionCell = document.createElement('td')
+      actionCell.className = 'participant-actions'
+
+      const eqButton = document.createElement('button')
+      eqButton.type = 'button'
+      eqButton.className = 'secondary participant-action-button'
+      eqButton.textContent = 'EQ'
+      eqButton.addEventListener('click', () => {
+        handlers.onOpenEq(participant.clientId)
+      })
+
+      actionCell.appendChild(eqButton)
+      row.appendChild(actionCell)
+    }
 
     tbody.appendChild(row)
   })
