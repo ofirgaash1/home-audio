@@ -3,15 +3,51 @@
   "description": "LAN audio relay for listening to PC audio on a phone over the same Wi-Fi",
   "version": "1.0.0",
   "private": true,
+  "main": "desktop/main.js",
   "license": "MIT",
   "scripts": {
     "lan-audio": "node lan-audio/server.js",
-    "test:eq-ui": "node lan-audio/ui-tests/eq-drag-host.mjs"
+    "test:eq-ui": "node lan-audio/ui-tests/eq-drag-host.mjs",
+    "desktop:dev": "electron .",
+    "desktop:dist": "electron-builder --win nsis"
   },
   "dependencies": {
     "weq8": "^0.2.2"
   },
   "devDependencies": {
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12",
     "playwright": "^1.58.2"
+  },
+  "build": {
+    "appId": "com.homeaudio.desktop",
+    "productName": "Home Audio",
+    "asar": true,
+    "files": [
+      "desktop/**/*",
+      "lan-audio/**/*",
+      "simplepeer.min.js",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   }
 }
