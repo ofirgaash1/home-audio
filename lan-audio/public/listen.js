@@ -11,7 +11,12 @@ const incomingMeterValue = document.querySelector('#incoming-meter-value')
 const playbackMeterCanvas = document.querySelector('#playback-meter')
 const playbackMeterValue = document.querySelector('#playback-meter-value')
 
-const listenerId = randomId('listener')
+const LISTENER_ID_STORAGE_KEY = 'home-audio.listener-id.v1'
+const AUTO_JOIN_STORAGE_KEY = 'home-audio.listener-autojoin.v1'
+const MAX_RECONNECT_DELAY_MS = 20000
+const RECONNECT_BASE_DELAY_MS = 1200
+const AUTO_JOIN_DEFAULT = true
+const listenerId = getPersistentListenerId()
 const AudioContextClass = window.AudioContext || window.webkitAudioContext
 
 let eventSource = null
@@ -34,6 +39,11 @@ let activePlaybackJob = null
 let activePlaybackStreamKey = ''
 let diagnosticsInterval = null
 let joined = false
+let joining = false
+let reconnectTimer = null
+let reconnectAttempt = 0
+let autoJoinEnabled = readAutoJoinPreference()
+let unloadInProgress = false
 let lastDiagnosticsText = ''
 let receiverStats = {
   bytesReceived: 'n/a',
@@ -57,6 +67,53 @@ let receiverStatsBusy = false
 const incomingVisualizer = createStreamVisualizer(incomingMeterCanvas, incomingMeterValue)
 const playbackVisualizer = createStreamVisualizer(playbackMeterCanvas, playbackMeterValue)
 
+function getPersistentListenerId() {
+  try {
+    const stored = window.localStorage.getItem(LISTENER_ID_STORAGE_KEY)
+    if (stored) return stored
+
+    const generated = randomId('listener')
+    window.localStorage.setItem(LISTENER_ID_STORAGE_KEY, generated)
+    return generated
+  } catch (error) {
+    return randomId('listener')
+  }
+}
+
+function readAutoJoinPreference() {
+  try {
+    const stored = window.localStorage.getItem(AUTO_JOIN_STORAGE_KEY)
+    if (stored === null) return AUTO_JOIN_DEFAULT
+    return stored !== '0'
+  } catch (error) {
+    return AUTO_JOIN_DEFAULT
+  }
+}
+
+function writeAutoJoinPreference(enabled) {
+  autoJoinEnabled = Boolean(enabled)
+
+  try {
+    window.localStorage.setItem(AUTO_JOIN_STORAGE_KEY, autoJoinEnabled ? '1' : '0')
+  } catch (error) {}
+}
+
+function shouldAutoJoin() {
+  return autoJoinEnabled && !unloadInProgress
+}
+
+function clearReconnectTimer() {
+  if (!reconnectTimer) return
+  window.clearTimeout(reconnectTimer)
+  reconnectTimer = null
+}
+
+function getReconnectDelay(attempt) {
+  const exp = Math.max(0, Number(attempt) - 1)
+  const delay = RECONNECT_BASE_DELAY_MS * Math.pow(2, Math.min(exp, 5))
+  return Math.min(MAX_RECONNECT_DELAY_MS, Math.round(delay))
+}
+
 function normalizeErrorMessage(error) {
   if (!error) return 'unknown error'
   if (typeof error === 'string') return error
@@ -73,6 +130,79 @@ function wait(ms) {
   return new Promise(resolve => {
     window.setTimeout(resolve, ms)
   })
+}
+
+function hasKnownBroadcaster() {
+  if (broadcasterId) return true
+  return participants.some(participant => participant.role === 'broadcaster')
+}
+
+function resetEventSource() {
+  if (!eventSource) return
+
+  try {
+    eventSource.close()
+  } catch (error) {}
+
+  eventSource = null
+}
+
+function scheduleReconnect(reason, immediate) {
+  if (!shouldAutoJoin()) return
+  if (!hasKnownBroadcaster() && joined) return
+  if (joining || reconnectTimer) return
+
+  reconnectAttempt += 1
+  const delayMs = immediate ? 120 : getReconnectDelay(reconnectAttempt)
+  const summary = reason ? String(reason).slice(0, 80) : 'connection lost'
+  setStatus(statusBox, `Reconnecting (${reconnectAttempt})... ${summary}`, 'warn')
+  renderDiagnostics()
+
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null
+    ensureJoined({
+      forceRegister: true,
+      reason: summary
+    }).catch(error => {
+      console.error(error)
+    })
+  }, delayMs)
+}
+
+async function executeHostCommand(payload) {
+  const command = payload && typeof payload.command === 'string'
+    ? payload.command.trim().toLowerCase()
+    : ''
+
+  if (!command) return
+
+  if (command === 'refresh') {
+    writeAutoJoinPreference(true)
+    setStatus(statusBox, 'Host requested refresh')
+    renderDiagnostics()
+    window.setTimeout(() => {
+      window.location.reload()
+    }, 120)
+    return
+  }
+
+  if (command === 'join') {
+    writeAutoJoinPreference(true)
+    reconnectAttempt = 0
+    clearReconnectTimer()
+    await ensureJoined({
+      forceRegister: true,
+      reason: 'host command join'
+    })
+    return
+  }
+
+  if (command === 'leave') {
+    await leaveAudio({
+      preserveAutoJoin: false,
+      closeEventSource: true
+    })
+  }
 }
 
 async function postSignalWithRetry(from, to, signal) {
@@ -622,6 +752,7 @@ function destroyPeer() {
   playbackSessionId += 1
   activePlaybackJob = null
   activePlaybackStreamKey = ''
+  peer.__manualDestroy = true
   peer.destroy()
   peer = null
   resetReceiverStats()
@@ -673,7 +804,8 @@ async function startPlayback(stream, sessionId) {
     delayMs: selfParticipant.delayMs,
     channelMode: selfParticipant.channelMode,
     context: playbackContext,
-    audibleDestination: true
+    audibleDestination: true,
+    keepAliveDestination: true
   })
   if (sessionId !== playbackSessionId) {
     await nextPlaybackProcessor.close().catch(() => {})
@@ -816,29 +948,66 @@ function attachPeerMediaFallback(nextPeer) {
   })
 }
 
-function ensureEventSource() {
+function ensureEventSource(options) {
+  const forceReset = Boolean(options && options.forceReset)
+  if (forceReset) {
+    resetEventSource()
+  }
+
   if (eventSource) return
 
-  eventSource = new EventSource(`/events?clientId=${encodeURIComponent(listenerId)}`)
+  const nextEventSource = new EventSource(`/events?clientId=${encodeURIComponent(listenerId)}`)
+  eventSource = nextEventSource
 
-  eventSource.addEventListener('host-left', () => {
+  nextEventSource.addEventListener('ready', () => {
+    if (eventSource !== nextEventSource) return
+    reconnectAttempt = 0
+  })
+
+  nextEventSource.addEventListener('error', () => {
+    if (eventSource !== nextEventSource) return
+    if (!shouldAutoJoin()) return
+
+    const sourceClosed = nextEventSource.readyState === EventSource.CLOSED
+    if (sourceClosed) {
+      resetEventSource()
+    }
+
+    if (joined && !hasKnownBroadcaster()) return
+    scheduleReconnect(sourceClosed ? 'events closed' : 'events reconnecting', sourceClosed)
+  })
+
+  nextEventSource.addEventListener('host-left', () => {
     destroyPeer()
     stopPlayback().catch(() => {})
     broadcasterId = null
-    joined = false
     lastDiagnosticsText = ''
-    updateParticipants([])
-    setStatus(statusBox, 'Host left', 'warn')
+    setStatus(statusBox, 'Waiting for host', 'warn')
     renderDiagnostics()
   })
 
-  eventSource.addEventListener('participants', event => {
+  nextEventSource.addEventListener('participants', event => {
     const payload = JSON.parse(event.data)
     updateParticipants(payload.participants)
   })
 
-  eventSource.addEventListener('signal', async event => {
+  nextEventSource.addEventListener('host-command', event => {
     const payload = JSON.parse(event.data)
+    executeHostCommand(payload).catch(error => {
+      console.error(error)
+      setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+      renderDiagnostics()
+    })
+  })
+
+  nextEventSource.addEventListener('signal', async event => {
+    const payload = JSON.parse(event.data)
+
+    if (broadcasterId && broadcasterId !== payload.from) {
+      destroyPeer()
+      await stopPlayback().catch(() => {})
+    }
+
     broadcasterId = payload.from
 
     if (!peer) {
@@ -853,9 +1022,11 @@ function createPeer(hostClientId) {
   const nextPeer = new SimplePeer({
     initiator: false,
     trickle: true,
+    sdpTransform: tuneOpusSdp,
     config: { iceServers: [] }
   })
 
+  nextPeer.__manualDestroy = false
   attachPeerMediaFallback(nextPeer)
   renderDiagnostics()
 
@@ -894,6 +1065,11 @@ function createPeer(hostClientId) {
     if (peer === nextPeer) {
       peer = null
     }
+
+    if (!nextPeer.__manualDestroy && shouldAutoJoin()) {
+      scheduleReconnect('peer closed', false)
+    }
+
     renderDiagnostics()
   })
 
@@ -902,7 +1078,13 @@ function createPeer(hostClientId) {
     if (peer === nextPeer) {
       peer = null
     }
-    setStatus(statusBox, 'Link failed', 'warn')
+
+    if (!nextPeer.__manualDestroy && shouldAutoJoin()) {
+      scheduleReconnect(normalizeErrorMessage(error), true)
+    } else {
+      setStatus(statusBox, 'Link failed', 'warn')
+    }
+
     renderDiagnostics()
   })
 
@@ -931,14 +1113,72 @@ async function joinAudio() {
   await pushDiagnostics()
 }
 
-async function leaveAudio() {
+async function ensureJoined(options) {
+  if (!shouldAutoJoin()) return
+  if (joining) return
+
+  const forceRegister = Boolean(options && options.forceRegister)
+  const reason = options && options.reason ? String(options.reason) : 'join'
+
+  joining = true
+  joinButton.disabled = true
+  leaveButton.disabled = false
+
+  if (!joined || forceRegister) {
+    setStatus(statusBox, forceRegister ? 'Rejoining' : 'Joining')
+  }
+
+  try {
+    if (forceRegister) {
+      destroyPeer()
+      await stopPlayback().catch(() => {})
+      ensureEventSource({ forceReset: true })
+    } else {
+      ensureEventSource()
+    }
+
+    await primeAudioContexts()
+    await joinAudio()
+    reconnectAttempt = 0
+    clearReconnectTimer()
+  } catch (error) {
+    console.error(error)
+    const message = normalizeErrorMessage(error)
+
+    if (shouldAutoJoin()) {
+      scheduleReconnect(`${reason}: ${message}`, false)
+    } else {
+      joinButton.disabled = false
+      leaveButton.disabled = true
+      setStatus(statusBox, message, 'warn')
+    }
+  } finally {
+    joining = false
+    renderDiagnostics()
+  }
+}
+
+async function leaveAudio(options) {
+  const preserveAutoJoin = Boolean(options && options.preserveAutoJoin)
+  const closeEventSourceConnection = Boolean(options && options.closeEventSource)
+
+  if (!preserveAutoJoin) {
+    writeAutoJoinPreference(false)
+  }
+
+  clearReconnectTimer()
   destroyPeer()
   await stopPlayback()
   await closeUnlockedPlaybackContext().catch(() => {})
   broadcasterId = null
   joined = false
+  joining = false
   lastDiagnosticsText = ''
   releaseWakeLock()
+
+  if (closeEventSourceConnection) {
+    resetEventSource()
+  }
 
   try {
     await postJson('/api/unregister', { clientId: listenerId })
@@ -954,23 +1194,20 @@ async function leaveAudio() {
 }
 
 joinButton.addEventListener('click', async () => {
-  joinButton.disabled = true
-  setStatus(statusBox, 'Joining')
-
-  try {
-    await primeAudioContexts()
-    await joinAudio()
-  } catch (error) {
-    console.error(error)
-    joinButton.disabled = false
-    leaveButton.disabled = true
-    setStatus(statusBox, error.message, 'warn')
-    renderDiagnostics()
-  }
+  writeAutoJoinPreference(true)
+  reconnectAttempt = 0
+  clearReconnectTimer()
+  await ensureJoined({
+    forceRegister: true,
+    reason: 'manual join'
+  })
 })
 
 leaveButton.addEventListener('click', () => {
-  leaveAudio().catch(error => {
+  leaveAudio({
+    preserveAutoJoin: false,
+    closeEventSource: true
+  }).catch(error => {
     console.error(error)
   })
 })
@@ -995,12 +1232,26 @@ document.addEventListener('visibilitychange', () => {
       playbackProcessor.context.resume().catch(() => {})
       player.play().catch(() => {})
     }
+
+    if (shouldAutoJoin()) {
+      if (!joined) {
+        ensureJoined({
+          forceRegister: false,
+          reason: 'resume join'
+        }).catch(() => {})
+      } else if (!peer && hasKnownBroadcaster()) {
+        scheduleReconnect('resume without peer', true)
+      }
+    }
+
     renderDiagnostics()
   }
 })
 
 window.addEventListener('beforeunload', () => {
-  if (eventSource) eventSource.close()
+  unloadInProgress = true
+  clearReconnectTimer()
+  resetEventSource()
   releaseWakeLock()
   incomingVisualizer.close().catch(() => {})
   playbackVisualizer.close().catch(() => {})
@@ -1012,3 +1263,13 @@ window.addEventListener('beforeunload', () => {
 
 renderParticipants()
 startDiagnostics()
+
+if (shouldAutoJoin()) {
+  joinButton.disabled = true
+  leaveButton.disabled = false
+  setStatus(statusBox, 'Auto joining')
+  ensureJoined({
+    forceRegister: false,
+    reason: 'startup'
+  }).catch(() => {})
+}

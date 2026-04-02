@@ -2,6 +2,7 @@
 
 const startButton = document.querySelector('#start')
 const stopButton = document.querySelector('#stop')
+const serverToggleButton = document.querySelector('#server-toggle')
 const statusBox = document.querySelector('#status')
 const listenLinks = document.querySelector('#listen-links')
 const listenerCount = document.querySelector('#listener-count')
@@ -31,12 +32,17 @@ const eqDrawerSubtitle = document.querySelector('#eq-drawer-subtitle')
 const eqDrawerStatus = document.querySelector('#eq-drawer-status')
 const eqUi = document.querySelector('#participant-eq-ui')
 
-const hostId = randomId('host')
+const HOST_ID_STORAGE_KEY = 'home-audio.host-id.v1'
+const hostId = getPersistentHostId()
 const peers = new Map()
 const listenerProcessors = new Map()
 const EQ_STORAGE_KEY = 'home-audio.host-eq.v2'
 const EQ_PRESETS_STORAGE_KEY = 'home-audio.host-eq.presets.v1'
 const HOST_EQ_STORAGE_SLOT = 'host-monitor'
+const DEFAULT_PRESET_NAME = 'default'
+const FLAT_PRESET_NAME = 'flat'
+const CUSTOM_PRESET_NAME = 'custom'
+const EQ_NUMERIC_TOLERANCE = 0.000001
 const DEFAULT_EQ_STATE = [
   { type: 'lowshelf12', frequency: 63, gain: 0, Q: 0.7, bypass: false },
   { type: 'peaking12', frequency: 136, gain: 0, Q: 0.7, bypass: false },
@@ -47,8 +53,13 @@ const DEFAULT_EQ_STATE = [
   { type: 'highshelf12', frequency: 6324, gain: 0, Q: 0.7, bypass: false },
   { type: 'noop', frequency: 350, gain: 0, Q: 1, bypass: false }
 ]
+const FLAT_EQ_STATE = DEFAULT_EQ_STATE.map(filter => ({
+  ...filter,
+  bypass: true
+}))
 const BUILTIN_EQ_PRESETS = {
-  Default: DEFAULT_EQ_STATE,
+  [DEFAULT_PRESET_NAME]: DEFAULT_EQ_STATE,
+  [FLAT_PRESET_NAME]: FLAT_EQ_STATE,
   '31.3.26': [
     { type: 'lowshelf12', frequency: 128.95592361951634, gain: -3.2555309734513287, Q: 0.7, bypass: false },
     { type: 'peaking12', frequency: 58.96004371289738, gain: -4.370575221238937, Q: 0.695010881248892, bypass: false },
@@ -65,6 +76,9 @@ let eventSource = null
 let captureStream = null
 let audioOnlyStream = null
 let stopping = false
+let serverRunning = true
+let serverControlBusy = false
+let unloadUnregisterSent = false
 let monitorProcessor = null
 let participants = []
 let diagnosticsInterval = null
@@ -88,6 +102,19 @@ function normalizeErrorMessage(error) {
   if (typeof error === 'string') return error
   if (error.message) return String(error.message)
   return String(error)
+}
+
+function getPersistentHostId() {
+  try {
+    const stored = window.localStorage.getItem(HOST_ID_STORAGE_KEY)
+    if (stored) return stored
+
+    const generated = randomId('host')
+    window.localStorage.setItem(HOST_ID_STORAGE_KEY, generated)
+    return generated
+  } catch (error) {
+    return randomId('host')
+  }
 }
 
 function wait(ms) {
@@ -138,6 +165,31 @@ function saveEqPresetStore() {
   }
 }
 
+function normalizePresetName(name) {
+  return String(name || '').trim()
+}
+
+function isCustomEqPresetName(name) {
+  return normalizePresetName(name).toLowerCase() === CUSTOM_PRESET_NAME
+}
+
+function getBuiltInEqPresetKey(name) {
+  const trimmed = normalizePresetName(name)
+  if (!trimmed) return ''
+
+  const direct = Object.prototype.hasOwnProperty.call(BUILTIN_EQ_PRESETS, trimmed)
+    ? trimmed
+    : ''
+  if (direct) return direct
+
+  const lowered = trimmed.toLowerCase()
+  return Object.keys(BUILTIN_EQ_PRESETS).find(key => key.toLowerCase() === lowered) || ''
+}
+
+function isReservedEqPresetName(name) {
+  return Boolean(getBuiltInEqPresetKey(name)) || isCustomEqPresetName(name)
+}
+
 function listEqPresetNames() {
   const names = new Set([
     ...Object.keys(BUILTIN_EQ_PRESETS),
@@ -147,9 +199,9 @@ function listEqPresetNames() {
 }
 
 function saveEqPreset(name, state) {
-  const trimmed = String(name || '').trim()
+  const trimmed = normalizePresetName(name)
   const nextState = cloneEqState(state)
-  if (!trimmed || !nextState || Object.prototype.hasOwnProperty.call(BUILTIN_EQ_PRESETS, trimmed)) {
+  if (!trimmed || !nextState || isReservedEqPresetName(trimmed)) {
     return false
   }
   eqPresetStore[trimmed] = nextState
@@ -158,22 +210,28 @@ function saveEqPreset(name, state) {
 }
 
 function getEqPreset(name) {
-  const trimmed = String(name || '').trim()
+  const trimmed = normalizePresetName(name)
   if (!trimmed) return null
-  if (Object.prototype.hasOwnProperty.call(BUILTIN_EQ_PRESETS, trimmed)) {
-    return cloneEqState(BUILTIN_EQ_PRESETS[trimmed])
+
+  const builtInKey = getBuiltInEqPresetKey(trimmed)
+  if (builtInKey) {
+    return cloneEqState(BUILTIN_EQ_PRESETS[builtInKey])
   }
   return cloneEqState(eqPresetStore[trimmed])
 }
 
 function isBuiltInEqPresetName(name) {
-  return Object.prototype.hasOwnProperty.call(BUILTIN_EQ_PRESETS, String(name || '').trim())
+  return Boolean(getBuiltInEqPresetKey(name))
 }
 
 function refreshEqPresetSelect(preferredName) {
   if (!eqPresetSelect) return
   const names = listEqPresetNames()
-  const previousValue = preferredName || eqPresetSelect.value
+  const previousValue = normalizePresetName(preferredName || eqPresetSelect.value)
+  const includeCustom = isCustomEqPresetName(previousValue)
+  if (includeCustom && !names.includes(CUSTOM_PRESET_NAME)) {
+    names.push(CUSTOM_PRESET_NAME)
+  }
   eqPresetSelect.textContent = ''
 
   names.forEach(name => {
@@ -192,13 +250,47 @@ function refreshEqPresetSelect(preferredName) {
 
   if (names.includes(previousValue)) {
     eqPresetSelect.value = previousValue
-  } else if (names.includes('Default')) {
-    eqPresetSelect.value = 'Default'
+  } else if (names.includes(DEFAULT_PRESET_NAME)) {
+    eqPresetSelect.value = DEFAULT_PRESET_NAME
   } else if (names.length) {
     eqPresetSelect.value = names[0]
   } else {
     eqPresetSelect.value = ''
   }
+}
+
+function areNumbersClose(left, right) {
+  return Math.abs(Number(left) - Number(right)) <= EQ_NUMERIC_TOLERANCE
+}
+
+function areEqStatesEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false
+  if (left.length !== right.length) return false
+
+  return left.every((leftFilter, index) => {
+    const rightFilter = right[index]
+    if (!leftFilter || !rightFilter) return false
+    return String(leftFilter.type || '') === String(rightFilter.type || '') &&
+      areNumbersClose(leftFilter.frequency, rightFilter.frequency) &&
+      areNumbersClose(leftFilter.gain, rightFilter.gain) &&
+      areNumbersClose(leftFilter.Q, rightFilter.Q) &&
+      Boolean(leftFilter.bypass) === Boolean(rightFilter.bypass)
+  })
+}
+
+function findMatchingEqPresetName(state) {
+  if (!Array.isArray(state)) return DEFAULT_PRESET_NAME
+
+  const presetNames = listEqPresetNames()
+  for (const name of presetNames) {
+    const presetState = getEqPreset(name)
+    if (!presetState) continue
+    if (areEqStatesEqual(state, presetState)) {
+      return name
+    }
+  }
+
+  return CUSTOM_PRESET_NAME
 }
 
 function getEqStorageSlot(clientId) {
@@ -424,6 +516,7 @@ function renderEqDrawer() {
 
   activeEqRuntime = runtime
   setEqUiRuntime(runtime)
+  refreshEqPresetSelect(findMatchingEqPresetName(runtime.spec))
   eqResetButton.disabled = false
   if (eqPresetSelect) {
     eqPresetSelect.disabled = listEqPresetNames().length === 0
@@ -738,15 +831,131 @@ function startDiagnostics() {
   }, 1000)
 }
 
-function renderLinks(status) {
-  if (!status.listenPages.length) {
-    listenLinks.innerHTML = '<p class="small">No LAN IP detected yet.</p>'
+function setServerToggleButtonState() {
+  if (!serverToggleButton) return
+  serverToggleButton.textContent = serverRunning ? 'stop server' : 'start server'
+  serverToggleButton.disabled = serverControlBusy
+}
+
+function applyServerRunningState(nextState) {
+  serverRunning = Boolean(nextState)
+  setServerToggleButtonState()
+
+  if (!serverRunning) {
+    startButton.disabled = true
+    stopButton.disabled = true
     return
   }
 
-  listenLinks.innerHTML = status.listenPages
-    .map(url => `<div class="codebox">${url}</div>`)
-    .join('')
+  if (audioOnlyStream) {
+    startButton.disabled = true
+    stopButton.disabled = false
+    return
+  }
+
+  startButton.disabled = false
+  stopButton.disabled = true
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+
+  const textArea = document.createElement('textarea')
+  textArea.value = text
+  textArea.setAttribute('readonly', '')
+  textArea.style.position = 'fixed'
+  textArea.style.left = '-9999px'
+  document.body.appendChild(textArea)
+  textArea.select()
+
+  const copied = document.execCommand('copy')
+  document.body.removeChild(textArea)
+
+  if (!copied) {
+    throw new Error('Copy failed')
+  }
+}
+
+function createListenLinkRow(url) {
+  const row = document.createElement('div')
+  row.className = 'link-row'
+
+  const urlBox = document.createElement('div')
+  urlBox.className = 'codebox'
+  urlBox.textContent = url
+
+  const copyButton = document.createElement('button')
+  copyButton.type = 'button'
+  copyButton.className = 'secondary link-copy-button'
+  copyButton.textContent = 'copy'
+
+  copyButton.addEventListener('click', async () => {
+    if (copyButton.disabled) return
+
+    copyButton.disabled = true
+
+    try {
+      await copyTextToClipboard(url)
+      copyButton.textContent = 'copied!'
+    } catch (error) {
+      copyButton.textContent = 'copy failed'
+      setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+    }
+
+    if (copyButton.__resetTimer) {
+      window.clearTimeout(copyButton.__resetTimer)
+    }
+
+    copyButton.__resetTimer = window.setTimeout(() => {
+      copyButton.textContent = 'copy'
+      copyButton.disabled = false
+      copyButton.__resetTimer = null
+    }, 1200)
+  })
+
+  row.appendChild(urlBox)
+  row.appendChild(copyButton)
+  return row
+}
+
+function renderLinks(status) {
+  const running = status && Object.prototype.hasOwnProperty.call(status, 'serverRunning')
+    ? Boolean(status.serverRunning)
+    : true
+  applyServerRunningState(running)
+
+  listenLinks.textContent = ''
+
+  if (!running) {
+    const message = document.createElement('p')
+    message.className = 'small'
+    message.textContent = 'Server stopped.'
+    listenLinks.appendChild(message)
+    return
+  }
+
+  const listenPages = Array.isArray(status && status.listenPages) ? status.listenPages : []
+
+  if (!listenPages.length) {
+    const message = document.createElement('p')
+    message.className = 'small'
+    message.textContent = 'No LAN IP detected yet.'
+    listenLinks.appendChild(message)
+    return
+  }
+
+  listenPages.forEach(url => {
+    listenLinks.appendChild(createListenLinkRow(url))
+  })
+}
+
+async function refreshStatusAndLinks() {
+  const status = await fetchStatus()
+  renderLinks(status)
+  return status
 }
 
 function populateDeviceSelect(select, devices, options) {
@@ -830,6 +1039,15 @@ function renderParticipants() {
     },
     onOpenEq(targetClientId) {
       openEqDrawer(targetClientId)
+    },
+    onSendListenerCommand(targetClientId, command) {
+      sendListenerCommand(targetClientId, command)
+        .then(() => {
+          setStatus(statusBox, `Sent ${command} to ${targetClientId.slice(-6)}`)
+        })
+        .catch(error => {
+          setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+        })
     }
   })
 
@@ -925,6 +1143,14 @@ async function updateParticipantSettings(targetClientId, settings) {
   updateParticipants(response.participants)
 }
 
+async function sendListenerCommand(targetClientId, command) {
+  await postJson('/api/listener-command', {
+    clientId: hostId,
+    targetClientId,
+    command
+  })
+}
+
 function attachEqPersistence(clientId, processor) {
   if (!processor || !processor.eqRuntime || typeof processor.eqRuntime.on !== 'function') {
     return
@@ -932,6 +1158,12 @@ function attachEqPersistence(clientId, processor) {
 
   processor.eqUnsubscribe = processor.eqRuntime.on('filtersChanged', state => {
     persistEqState(clientId, state)
+    if (clientId === selectedEqClientId && activeEqRuntime === processor.eqRuntime) {
+      refreshEqPresetSelect(findMatchingEqPresetName(state))
+      if (eqBypassButton) {
+        eqBypassButton.textContent = areAllActiveEqFiltersBypassed(processor.eqRuntime) ? 'Unbypass' : 'Bypass'
+      }
+    }
   })
 }
 
@@ -1006,7 +1238,20 @@ function destroyPeer(clientId) {
 
 async function createPeer(listenerId) {
   const existingPeer = peers.get(listenerId)
-  if (existingPeer) return existingPeer
+  if (existingPeer) {
+    const pc = existingPeer._pc
+    const connectionState = pc && pc.connectionState ? pc.connectionState : ''
+    const needsReplacement = existingPeer.destroyed ||
+      connectionState === 'failed' ||
+      connectionState === 'closed' ||
+      connectionState === 'disconnected'
+
+    if (!needsReplacement) {
+      return existingPeer
+    }
+
+    destroyPeer(listenerId)
+  }
   await ensureEqModules()
 
   const listenerParticipant = findParticipant(participants, listenerId) || {
@@ -1026,6 +1271,7 @@ async function createPeer(listenerId) {
   const peer = new SimplePeer({
     initiator: true,
     trickle: true,
+    sdpTransform: tuneOpusSdp,
     config: { iceServers: [] }
   })
 
@@ -1164,8 +1410,7 @@ async function stopBroadcast() {
 
   lastDiagnosticsText = ''
   updateParticipants([])
-  startButton.disabled = false
-  stopButton.disabled = true
+  applyServerRunningState(serverRunning)
   setStatus(statusBox, 'Idle')
   stopping = false
   renderDiagnostics()
@@ -1184,7 +1429,37 @@ function requestSelfDelayChange(delayMs) {
   })
 }
 
+function unregisterHostOnUnload() {
+  if (unloadUnregisterSent) return
+  unloadUnregisterSent = true
+
+  const body = JSON.stringify({ clientId: hostId })
+
+  if (navigator.sendBeacon && typeof navigator.sendBeacon === 'function') {
+    try {
+      const payload = new Blob([body], { type: 'application/json' })
+      navigator.sendBeacon('/api/unregister', payload)
+      return
+    } catch (error) {}
+  }
+
+  fetch('/api/unregister', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body,
+    keepalive: true
+  }).catch(() => {})
+}
+
 startButton.addEventListener('click', async () => {
+  if (!serverRunning) {
+    setStatus(statusBox, 'Server is stopped. Click Start Server first.', 'warn')
+    applyServerRunningState(serverRunning)
+    return
+  }
+
   startButton.disabled = true
   setStatus(statusBox, 'Opening...')
 
@@ -1199,8 +1474,7 @@ startButton.addEventListener('click', async () => {
     audioOnlyStream = null
     sourceVisualizer.clear('Waiting for audio')
     stopLocalMonitor()
-    startButton.disabled = false
-    stopButton.disabled = true
+    applyServerRunningState(serverRunning)
     setStatus(statusBox, error.message, 'warn')
   }
 })
@@ -1208,6 +1482,34 @@ startButton.addEventListener('click', async () => {
 stopButton.addEventListener('click', () => {
   stopBroadcast()
 })
+
+if (serverToggleButton) {
+  serverToggleButton.addEventListener('click', async () => {
+    if (serverControlBusy) return
+
+    serverControlBusy = true
+    setServerToggleButtonState()
+
+    try {
+      if (serverRunning) {
+        await stopBroadcast()
+      }
+
+      const action = serverRunning ? 'stop' : 'start'
+      const status = await postJson('/api/server-control', { action })
+      renderLinks(status)
+      setStatus(statusBox, status.serverRunning ? 'Server running.' : 'Server stopped.')
+    } catch (error) {
+      setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+      try {
+        await refreshStatusAndLinks()
+      } catch (refreshError) {}
+    } finally {
+      serverControlBusy = false
+      setServerToggleButtonState()
+    }
+  })
+}
 
 refreshDevicesButton.addEventListener('click', () => {
   refreshMediaDevices({ primeLabels: true }).catch(error => {
@@ -1239,13 +1541,14 @@ if (eqDrawerCloseButton) {
 
 eqResetButton.addEventListener('click', () => {
   if (!selectedEqClientId || !activeEqRuntime) return
-  clearSavedEqState(selectedEqClientId)
-  applyEqStateToRuntime(activeEqRuntime, cloneEqState(DEFAULT_EQ_STATE))
-  persistEqState(selectedEqClientId, DEFAULT_EQ_STATE)
+  const flatState = getEqPreset(FLAT_PRESET_NAME) || cloneEqState(DEFAULT_EQ_STATE)
+  applyEqStateToRuntime(activeEqRuntime, flatState)
+  persistEqState(selectedEqClientId, flatState)
+  refreshEqPresetSelect(FLAT_PRESET_NAME)
   if (eqBypassButton) {
-    eqBypassButton.textContent = 'Bypass'
+    eqBypassButton.textContent = areAllActiveEqFiltersBypassed(activeEqRuntime) ? 'Unbypass' : 'Bypass'
   }
-  eqDrawerStatus.textContent = 'Reset.'
+  eqDrawerStatus.textContent = `Preset loaded: ${FLAT_PRESET_NAME}.`
 })
 
 if (eqSavePresetButton) {
@@ -1253,7 +1556,7 @@ if (eqSavePresetButton) {
     if (!activeEqRuntime) return
 
     const selectedName = String(eqPresetSelect && eqPresetSelect.value ? eqPresetSelect.value : '').trim()
-    const nameToSave = selectedName && !isBuiltInEqPresetName(selectedName)
+    const nameToSave = selectedName && !isBuiltInEqPresetName(selectedName) && !isCustomEqPresetName(selectedName)
       ? selectedName
       : `Preset ${new Date().toISOString().slice(0, 19).replace('T', ' ')}`
 
@@ -1272,6 +1575,11 @@ if (eqPresetSelect) {
     if (!selectedEqClientId || !activeEqRuntime) return
 
     const selectedName = String(eqPresetSelect.value || '').trim()
+    if (isCustomEqPresetName(selectedName)) {
+      eqDrawerStatus.textContent = 'Preset: custom.'
+      return
+    }
+
     if (!selectedName) {
       eqDrawerStatus.textContent = 'No presets saved.'
       return
@@ -1314,6 +1622,7 @@ presetButtons.forEach(button => {
 })
 
 window.addEventListener('beforeunload', () => {
+  unregisterHostOnUnload()
   if (eventSource) eventSource.close()
   closeEqDrawer()
   stopLocalMonitor()
@@ -1324,14 +1633,18 @@ window.addEventListener('beforeunload', () => {
   }
 })
 
+window.addEventListener('pagehide', () => {
+  unregisterHostOnUnload()
+})
+
 updateMonitorDelayLabel()
 renderParticipants()
 startDiagnostics()
 renderRemoteDiagnostics()
 renderEqDrawer()
+applyServerRunningState(serverRunning)
 
-fetchStatus()
-  .then(renderLinks)
+refreshStatusAndLinks()
   .catch(error => {
     setStatus(statusBox, error.message, 'warn')
     renderDiagnostics()

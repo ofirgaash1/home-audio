@@ -25,8 +25,22 @@
   <body>
     <main class="shell">
       <section class="hero">
-        <div class="eyebrow">Host</div>
-        <h1>Home Audio</h1>
+        <div class="hero-top">
+          <div>
+            <div class="eyebrow">Host</div>
+            <h1>Home Audio</h1>
+          </div>
+          <form action="https://www.paypal.com/donate" method="post" target="_top" class="donate-form">
+            <input type="hidden" name="hosted_button_id" value="MRJF9A83YR2BE">
+            <input
+              type="image"
+              src="https://www.paypalobjects.com/en_US/IL/i/btn/btn_donateCC_LG.gif"
+              border="0"
+              name="submit"
+              title="PayPal - The safer, easier way to pay online!"
+              alt="Donate with PayPal">
+          </form>
+        </div>
         <div class="grid">
           <div class="card">
             <p class="small">Source</p>
@@ -34,6 +48,7 @@
               <select id="source-device"></select>
               <button id="refresh-devices" type="button" class="secondary">Refresh</button>
             </div>
+            <p class="small" style="margin-top: 12px;">Normally: CABLE Output (VB-Audio Virtual Cable)</p>
           </div>
           <div class="card">
             <p class="small">Monitor</p>
@@ -52,6 +67,7 @@
         <div class="button-row">
           <button id="start">Start</button>
           <button id="stop" class="secondary" disabled>Stop</button>
+          <button id="server-toggle" class="secondary" type="button">stop server</button>
         </div>
         <div class="status" id="status">Idle</div>
         <audio id="monitor-player" autoplay playsinline hidden></audio>

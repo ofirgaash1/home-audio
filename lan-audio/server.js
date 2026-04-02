@@ -19,6 +19,14 @@ const MAX_DEBUG_EVENTS = Math.max(
   50,
   Math.min(5000, Number(process.env.HOME_AUDIO_DEBUG_MAX_EVENTS || 400) || 400)
 )
+const SSE_HEARTBEAT_MS = Math.max(
+  5000,
+  Number(process.env.HOME_AUDIO_SSE_HEARTBEAT_MS || 15000) || 15000
+)
+const SSE_DISCONNECT_GRACE_MS = Math.max(
+  0,
+  Number(process.env.HOME_AUDIO_SSE_DISCONNECT_GRACE_MS || 60000) || 60000
+)
 const DELAY_MIN_MS = 0
 const DELAY_MAX_MS = 300
 const DELAY_STEP_MS = 5
@@ -118,6 +126,7 @@ function serveFile(res, filePath) {
 
 function createState() {
   return {
+    serverRunning: true,
     broadcasterId: null,
     clients: new Map(),
     startedAt: new Date().toISOString(),
@@ -258,6 +267,8 @@ function getOrCreateClient(state, clientId) {
       id: clientId,
       role: null,
       res: null,
+      disconnectTimer: null,
+      disconnectedAt: null,
       settings: null,
       diagnostics: '',
       diagnosticsAt: null,
@@ -267,6 +278,19 @@ function getOrCreateClient(state, clientId) {
     state.clients.set(clientId, client)
   }
   return client
+}
+
+function clearDisconnectTimer(client) {
+  if (!client || !client.disconnectTimer) {
+    if (client) {
+      client.disconnectedAt = null
+    }
+    return
+  }
+
+  clearTimeout(client.disconnectTimer)
+  client.disconnectTimer = null
+  client.disconnectedAt = null
 }
 
 function applyClientSettings(client, role, nextSettings) {
@@ -341,6 +365,7 @@ function getClientDebugSnapshot(client, labelMap) {
     role: client.role,
     label: client.role ? (labelMap.get(client.id) || null) : null,
     connected: Boolean(client.res),
+    disconnectedAt: client.disconnectedAt,
     settings: client.settings || null,
     diagnosticsAt: client.diagnosticsAt,
     diagnosticsSummary,
@@ -355,6 +380,7 @@ function getDebugStateSnapshot(state, activePort) {
 
   return {
     server: {
+      running: Boolean(state.serverRunning),
       host: HOST,
       port: activePort,
       startedAt: state.startedAt,
@@ -371,6 +397,15 @@ function getDebugStateSnapshot(state, activePort) {
       debugSubscribers: state.debugSubscribers.size
     },
     recentEvents: state.debugEvents.slice(-100)
+  }
+}
+
+function getStatusSnapshot(state, activePort) {
+  return {
+    serverRunning: Boolean(state.serverRunning),
+    hostPage: `http://localhost:${activePort}/host`,
+    listenPages: getLanAddresses(activePort).map(url => `${url}/listen`),
+    port: activePort
   }
 }
 
@@ -410,10 +445,45 @@ function listListenerIds(state) {
     .map(client => client.id)
 }
 
+function stopService(state, reason) {
+  if (!state.serverRunning) return false
+  state.serverRunning = false
+
+  const activeClientIds = Array.from(state.clients.values())
+    .filter(client => client.role)
+    .map(client => client.id)
+
+  activeClientIds.forEach(clientId => {
+    unregisterClient(state, clientId, reason || 'service-stop')
+  })
+
+  state.clients.forEach(client => {
+    clearDisconnectTimer(client)
+    const clientRes = client.res
+    client.res = null
+    if (clientRes) {
+      try {
+        clientRes.end()
+      } catch (error) {}
+    }
+  })
+
+  return true
+}
+
+function startService(state) {
+  if (state.serverRunning) return false
+  state.serverRunning = true
+  return true
+}
+
 function unregisterClient(state, clientId, reason) {
   const client = state.clients.get(clientId)
   if (!client) return
+  clearDisconnectTimer(client)
+
   if (!client.role) {
+    client.res = null
     client.settings = null
     client.diagnostics = ''
     client.diagnosticsAt = null
@@ -445,6 +515,7 @@ function unregisterClient(state, clientId, reason) {
   })
 
   client.role = null
+  client.res = null
   client.settings = null
   client.diagnostics = ''
   client.diagnosticsAt = null
@@ -460,6 +531,14 @@ function attachSse(state, req, res, parsedUrl) {
   }
 
   const client = getOrCreateClient(state, clientId)
+  clearDisconnectTimer(client)
+
+  if (client.res && client.res !== res) {
+    try {
+      client.res.end()
+    } catch (error) {}
+  }
+
   client.res = res
 
   res.writeHead(200, {
@@ -472,12 +551,49 @@ function attachSse(state, req, res, parsedUrl) {
   res.write(': connected\n\n')
   sendEvent(client, 'ready', { clientId })
   sendEvent(client, 'diagnostics', { diagnostics: getDiagnosticsSnapshot(state) })
+  const heartbeatTimer = setInterval(() => {
+    if (client.res !== res) {
+      clearInterval(heartbeatTimer)
+      return
+    }
+
+    try {
+      res.write(': keepalive\n\n')
+    } catch (error) {
+      clearInterval(heartbeatTimer)
+    }
+  }, SSE_HEARTBEAT_MS)
+
+  if (client.role === 'listener' && state.broadcasterId) {
+    const broadcaster = state.clients.get(state.broadcasterId)
+    if (broadcaster && broadcaster.res) {
+      sendEvent(broadcaster, 'listener-joined', {
+        clientId,
+        reason: 'sse-reconnect'
+      })
+    }
+  }
 
   req.on('close', () => {
+    clearInterval(heartbeatTimer)
     const currentClient = state.clients.get(clientId)
     if (!currentClient) return
+    if (currentClient.res !== res) return
+
     currentClient.res = null
-    unregisterClient(state, clientId, 'sse-close')
+    currentClient.disconnectedAt = new Date().toISOString()
+
+    if (SSE_DISCONNECT_GRACE_MS <= 0) {
+      unregisterClient(state, clientId, 'sse-close')
+      return
+    }
+
+    currentClient.disconnectTimer = setTimeout(() => {
+      const latestClient = state.clients.get(clientId)
+      if (!latestClient || latestClient.res) return
+      latestClient.disconnectTimer = null
+      unregisterClient(state, clientId, 'sse-timeout')
+    }, SSE_DISCONNECT_GRACE_MS)
   })
 }
 
@@ -522,6 +638,7 @@ async function handleRegister(state, req, res) {
   }
 
   const client = getOrCreateClient(state, clientId)
+  clearDisconnectTimer(client)
   client.lastDirectFallbackAt = null
   client.lastDirectFallbackStatus = ''
 
@@ -646,6 +763,63 @@ async function handleParticipantSettings(state, req, res) {
   sendJson(res, 200, { ok: true, participants })
 }
 
+async function handleListenerCommand(state, req, res) {
+  const body = await readBody(req)
+  const actorClientId = body.clientId
+  const targetClientId = body.targetClientId
+  const command = typeof body.command === 'string'
+    ? body.command.trim().toLowerCase()
+    : ''
+  const validCommands = new Set(['refresh', 'join', 'leave'])
+
+  if (!actorClientId || !targetClientId || !validCommands.has(command)) {
+    sendJson(res, 400, { error: 'Missing or invalid clientId, targetClientId, or command' })
+    return
+  }
+
+  const actor = state.clients.get(actorClientId)
+  if (!actor || actor.role !== 'broadcaster' || state.broadcasterId !== actorClientId) {
+    sendJson(res, 403, { error: 'Only active host may issue listener commands' })
+    return
+  }
+
+  const targets = targetClientId === '*'
+    ? Array.from(state.clients.values())
+      .filter(client => client.role === 'listener' && client.res)
+    : [state.clients.get(targetClientId)].filter(Boolean)
+
+  const activeTargets = targets.filter(client => client.role === 'listener' && client.res)
+
+  if (!activeTargets.length) {
+    sendJson(res, 404, { error: 'Target listener is not connected' })
+    return
+  }
+
+  const emittedAt = new Date().toISOString()
+
+  activeTargets.forEach(target => {
+    sendEvent(target, 'host-command', {
+      command,
+      requestedBy: actorClientId,
+      targetClientId: target.id,
+      at: emittedAt
+    })
+  })
+
+  recordDebugEvent(state, 'listener-command', {
+    actorClientId,
+    targetClientId,
+    deliveredCount: activeTargets.length,
+    command
+  })
+
+  sendJson(res, 200, {
+    ok: true,
+    deliveredCount: activeTargets.length,
+    command
+  })
+}
+
 async function handleClientDiagnostics(state, req, res) {
   const body = await readBody(req)
   const clientId = body.clientId
@@ -685,6 +859,39 @@ async function handleClientDiagnostics(state, req, res) {
   sendJson(res, 200, { ok: true, diagnostics })
 }
 
+async function handleServerControl(state, req, res, activePort) {
+  const body = await readBody(req)
+  const action = typeof body.action === 'string'
+    ? body.action.trim().toLowerCase()
+    : ''
+
+  if (action !== 'start' && action !== 'stop') {
+    sendJson(res, 400, { error: 'Invalid action. Use start or stop.' })
+    return
+  }
+
+  if (action === 'stop') {
+    const changed = stopService(state, 'api-server-stop')
+    recordDebugEvent(state, 'server-control', {
+      action: 'stop',
+      changed,
+      running: state.serverRunning
+    })
+  } else {
+    const changed = startService(state)
+    recordDebugEvent(state, 'server-control', {
+      action: 'start',
+      changed,
+      running: state.serverRunning
+    })
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    ...getStatusSnapshot(state, activePort)
+  })
+}
+
 function createServer() {
   const state = createState()
   const server = http.createServer(async (req, res) => {
@@ -704,6 +911,10 @@ function createServer() {
       }
 
       if (req.method === 'GET' && parsedUrl.pathname === '/events') {
+        if (!state.serverRunning) {
+          sendJson(res, 503, { error: 'Server is stopped' })
+          return
+        }
         attachSse(state, req, res, parsedUrl)
         return
       }
@@ -718,12 +929,29 @@ function createServer() {
         return
       }
 
+      if (req.method === 'POST' && parsedUrl.pathname === '/api/server-control') {
+        await handleServerControl(state, req, res, activePort)
+        return
+      }
+
       if (req.method === 'GET' && parsedUrl.pathname === '/api/status') {
-        sendJson(res, 200, {
-          hostPage: `http://localhost:${activePort}/host`,
-          listenPages: getLanAddresses(activePort).map(url => `${url}/listen`),
-          port: activePort
-        })
+        sendJson(res, 200, getStatusSnapshot(state, activePort))
+        return
+      }
+
+      const requiresRunningServer =
+        (req.method === 'GET' && parsedUrl.pathname === '/events') ||
+        (req.method === 'POST' && (
+          parsedUrl.pathname === '/api/register' ||
+          parsedUrl.pathname === '/api/unregister' ||
+          parsedUrl.pathname === '/api/signal' ||
+          parsedUrl.pathname === '/api/participant-settings' ||
+          parsedUrl.pathname === '/api/listener-command' ||
+          parsedUrl.pathname === '/api/client-diagnostics'
+        ))
+
+      if (!state.serverRunning && requiresRunningServer) {
+        sendJson(res, 503, { error: 'Server is stopped' })
         return
       }
 
@@ -744,6 +972,11 @@ function createServer() {
 
       if (req.method === 'POST' && parsedUrl.pathname === '/api/participant-settings') {
         await handleParticipantSettings(state, req, res)
+        return
+      }
+
+      if (req.method === 'POST' && parsedUrl.pathname === '/api/listener-command') {
+        await handleListenerCommand(state, req, res)
         return
       }
 

@@ -1,7 +1,7 @@
 {
   "name": "home-audio",
   "description": "LAN audio relay for listening to PC audio on a phone over the same Wi-Fi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "main": "desktop/main.js",
   "license": "MIT",

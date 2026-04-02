@@ -46,6 +46,23 @@ body {
   margin-bottom: 14px;
 }
 
+.hero-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.donate-form {
+  flex: 0 0 auto;
+}
+
+.donate-form input[type='image'] {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
 .panel {
   padding: 18px;
   margin-top: 14px;
@@ -186,6 +203,26 @@ button:disabled {
   margin-top: 16px;
 }
 
+.link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.link-row .codebox {
+  margin-top: 0;
+  flex: 1 1 auto;
+}
+
+.link-copy-button {
+  flex: 0 0 auto;
+  min-width: 84px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  line-height: 1.1;
+}
+
 .meter-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -269,9 +306,15 @@ button:disabled {
 }
 
 .participant-actions {
-  width: 72px;
+  width: 170px;
   white-space: normal;
   text-align: right;
+}
+
+.participant-action-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .participant-action-button {
@@ -425,6 +468,15 @@ audio {
     padding: 16px;
   }
 
+  .hero-top {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .donate-form {
+    align-self: flex-end;
+  }
+
   .panel {
     padding: 14px;
   }
@@ -437,6 +489,15 @@ audio {
 
   .button-row > * {
     flex: 1 1 100%;
+  }
+
+  .link-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .link-copy-button {
+    width: 100%;
   }
 
   .participant-table,
@@ -461,6 +522,11 @@ audio {
     width: auto;
     text-align: left;
     font-size: 14px;
+  }
+
+  .participant-action-stack {
+    flex-direction: row;
+    flex-wrap: wrap;
   }
 
   .delay-controls {

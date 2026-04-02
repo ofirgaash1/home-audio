@@ -107,6 +107,9 @@ function tuneOpusSdp(sdp) {
   const desiredParams = {
     stereo: '1',
     'sprop-stereo': '1',
+    usedtx: '0',
+    cbr: '1',
+    useinbandfec: '1',
     maxaveragebitrate: '256000',
     maxplaybackrate: '48000'
   }
@@ -829,12 +832,14 @@ function formatParticipantLabel(participant, currentClientId) {
 
 function renderParticipantsTable(tbody, participants, currentClientId, handlers) {
   const includeEqAction = Boolean(handlers && typeof handlers.onOpenEq === 'function')
+  const includeListenerControls = Boolean(handlers && typeof handlers.onSendListenerCommand === 'function')
+  const includeActions = includeEqAction || includeListenerControls
   tbody.textContent = ''
 
   if (!participants.length) {
     const row = document.createElement('tr')
     const cell = document.createElement('td')
-    cell.colSpan = includeEqAction ? 4 : 3
+    cell.colSpan = includeActions ? 4 : 3
     cell.className = 'participant-empty'
     cell.textContent = 'No active participants yet.'
     row.appendChild(cell)
@@ -897,19 +902,53 @@ function renderParticipantsTable(tbody, participants, currentClientId, handlers)
     channelCell.appendChild(channelSelect)
     row.appendChild(channelCell)
 
-    if (includeEqAction) {
+    if (includeActions) {
       const actionCell = document.createElement('td')
       actionCell.className = 'participant-actions'
 
-      const eqButton = document.createElement('button')
-      eqButton.type = 'button'
-      eqButton.className = 'secondary participant-action-button'
-      eqButton.textContent = 'EQ'
-      eqButton.addEventListener('click', () => {
-        handlers.onOpenEq(participant.clientId)
-      })
+      const actionStack = document.createElement('div')
+      actionStack.className = 'participant-action-stack'
 
-      actionCell.appendChild(eqButton)
+      if (includeEqAction) {
+        const eqButton = document.createElement('button')
+        eqButton.type = 'button'
+        eqButton.className = 'secondary participant-action-button'
+        eqButton.textContent = 'EQ'
+        eqButton.addEventListener('click', () => {
+          handlers.onOpenEq(participant.clientId)
+        })
+        actionStack.appendChild(eqButton)
+      }
+
+      if (includeListenerControls && participant.role === 'listener') {
+        const refreshButton = document.createElement('button')
+        refreshButton.type = 'button'
+        refreshButton.className = 'secondary participant-action-button'
+        refreshButton.textContent = 'Refresh'
+        refreshButton.addEventListener('click', () => {
+          handlers.onSendListenerCommand(participant.clientId, 'refresh')
+        })
+
+        const rejoinButton = document.createElement('button')
+        rejoinButton.type = 'button'
+        rejoinButton.className = 'secondary participant-action-button'
+        rejoinButton.textContent = 'Rejoin'
+        rejoinButton.addEventListener('click', () => {
+          handlers.onSendListenerCommand(participant.clientId, 'join')
+        })
+
+        const leaveButton = document.createElement('button')
+        leaveButton.type = 'button'
+        leaveButton.className = 'secondary participant-action-button'
+        leaveButton.textContent = 'Leave'
+        leaveButton.addEventListener('click', () => {
+          handlers.onSendListenerCommand(participant.clientId, 'leave')
+        })
+
+        actionStack.append(refreshButton, rejoinButton, leaveButton)
+      }
+
+      actionCell.appendChild(actionStack)
       row.appendChild(actionCell)
     }
 
