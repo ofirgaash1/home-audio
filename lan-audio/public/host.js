@@ -2,6 +2,7 @@
 
 const startButton = document.querySelector('#start')
 const stopButton = document.querySelector('#stop')
+const takeoverButton = document.querySelector('#takeover')
 const serverToggleButton = document.querySelector('#server-toggle')
 const statusBox = document.querySelector('#status')
 const listenLinks = document.querySelector('#listen-links')
@@ -33,7 +34,9 @@ const eqDrawerStatus = document.querySelector('#eq-drawer-status')
 const eqUi = document.querySelector('#participant-eq-ui')
 
 const HOST_ID_STORAGE_KEY = 'home-audio.host-id.v1'
+const HOST_SESSION_ID_STORAGE_KEY = 'home-audio.host-session-id.v1'
 const hostId = getPersistentHostId()
+const hostSessionId = getPersistentHostSessionId()
 const peers = new Map()
 const listenerProcessors = new Map()
 const EQ_STORAGE_KEY = 'home-audio.host-eq.v2'
@@ -79,6 +82,7 @@ let stopping = false
 let serverRunning = true
 let serverControlBusy = false
 let unloadUnregisterSent = false
+let hostConflict = null
 let monitorProcessor = null
 let participants = []
 let diagnosticsInterval = null
@@ -115,6 +119,56 @@ function getPersistentHostId() {
   } catch (error) {
     return randomId('host')
   }
+}
+
+function getPersistentHostSessionId() {
+  try {
+    const stored = window.sessionStorage.getItem(HOST_SESSION_ID_STORAGE_KEY)
+    if (stored) return stored
+
+    const generated = randomId('host-session')
+    window.sessionStorage.setItem(HOST_SESSION_ID_STORAGE_KEY, generated)
+    return generated
+  } catch (error) {
+    return randomId('host-session')
+  }
+}
+
+function createApiError(status, payload) {
+  const message = payload && payload.error
+    ? String(payload.error)
+    : 'Request failed'
+  const error = new Error(message)
+  error.status = status
+  error.payload = payload || {}
+  return error
+}
+
+function clearHostConflict() {
+  hostConflict = null
+  if (takeoverButton) {
+    takeoverButton.disabled = true
+  }
+}
+
+function setHostConflict(payload) {
+  hostConflict = payload || { errorCode: 'HOST_ACTIVE' }
+  if (!takeoverButton) return
+  if (!serverRunning || Boolean(audioOnlyStream) || stopping) {
+    takeoverButton.disabled = true
+    return
+  }
+  takeoverButton.disabled = false
+}
+
+function summarizeActiveHostConflict(payload) {
+  const activeHost = payload && payload.activeHost ? payload.activeHost : null
+  if (!activeHost || !activeHost.clientId) {
+    return 'Another host session is already active.'
+  }
+
+  const suffix = activeHost.clientId.slice(-6)
+  return `Another host session is active (${suffix}).`
 }
 
 function wait(ms) {
@@ -366,7 +420,7 @@ async function postSignalWithRetry(from, to, signal) {
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      await postJson('/api/signal', { from, to, signal })
+      await postJson('/api/signal', { from, to, signal, sessionId: hostSessionId })
       return
     } catch (error) {
       lastError = error
@@ -382,6 +436,37 @@ async function postSignalWithRetry(from, to, signal) {
   }
 
   throw lastError || new Error('Signal send failed')
+}
+
+async function registerBroadcaster(options) {
+  const takeover = Boolean(options && options.takeover)
+  const response = await fetch('/api/register', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      clientId: hostId,
+      role: 'broadcaster',
+      sessionId: hostSessionId,
+      takeover,
+      settings: {
+        delayMs: clampDelay(monitorDelayInput.value),
+        channelMode: 'stereo'
+      }
+    })
+  })
+
+  let json = {}
+  try {
+    json = await response.json()
+  } catch (error) {}
+
+  if (!response.ok) {
+    throw createApiError(response.status, json)
+  }
+
+  return json
 }
 
 function isCableDeviceLabel(label) {
@@ -759,6 +844,7 @@ function getDiagnosticsText() {
 
   return [
     `hostId=${hostId}`,
+    `hostSessionId=${hostSessionId}`,
     `participants=${participants.length}`,
     `sourceDevice=${sourceDeviceSelect.value || 'none'}`,
     `monitorDevice=${monitorDeviceSelect.value || 'default'}`,
@@ -772,6 +858,7 @@ function getDiagnosticsText() {
       ? monitorProcessor.getLevel().toFixed(4)
       : 'n/a'}`,
     `status="${statusBox.textContent}"`,
+    `hostConflict=${hostConflict ? 'yes' : 'no'}`,
     '',
     ...peerLines
   ].join('\n')
@@ -844,17 +931,26 @@ function applyServerRunningState(nextState) {
   if (!serverRunning) {
     startButton.disabled = true
     stopButton.disabled = true
+    if (takeoverButton) {
+      takeoverButton.disabled = true
+    }
     return
   }
 
   if (audioOnlyStream) {
     startButton.disabled = true
     stopButton.disabled = false
+    if (takeoverButton) {
+      takeoverButton.disabled = true
+    }
     return
   }
 
   startButton.disabled = false
   stopButton.disabled = true
+  if (takeoverButton) {
+    takeoverButton.disabled = !hostConflict
+  }
 }
 
 async function copyTextToClipboard(text) {
@@ -956,6 +1052,46 @@ async function refreshStatusAndLinks() {
   const status = await fetchStatus()
   renderLinks(status)
   return status
+}
+
+async function refreshHostSessionConflict() {
+  try {
+    const response = await fetch('/api/debug/state', { cache: 'no-store' })
+    if (!response.ok) return
+    const snapshot = await response.json()
+    const activeHostClientId = snapshot && snapshot.broadcasterId
+      ? String(snapshot.broadcasterId)
+      : ''
+    const activeHostSessionId = snapshot && snapshot.broadcasterSessionId
+      ? String(snapshot.broadcasterSessionId)
+      : ''
+
+    if (!activeHostClientId) {
+      if (!audioOnlyStream) {
+        clearHostConflict()
+      }
+      return
+    }
+
+    if (activeHostClientId === hostId && activeHostSessionId === hostSessionId) {
+      clearHostConflict()
+      return
+    }
+
+    setHostConflict({
+      errorCode: 'HOST_ACTIVE',
+      activeHost: {
+        clientId: activeHostClientId,
+        sessionId: activeHostSessionId,
+        startedAt: snapshot && snapshot.broadcasterSessionStartedAt
+          ? snapshot.broadcasterSessionStartedAt
+          : null
+      }
+    })
+    if (!audioOnlyStream && !stopping) {
+      setStatus(statusBox, `${summarizeActiveHostConflict(hostConflict)} Click Take Over to replace it.`, 'warn')
+    }
+  } catch (error) {}
 }
 
 function populateDeviceSelect(select, devices, options) {
@@ -1092,34 +1228,88 @@ function updateParticipants(nextParticipants) {
   renderRemoteDiagnostics()
 }
 
-function ensureEventSource() {
+function resetEventSource() {
+  if (!eventSource) return
+  try {
+    eventSource.close()
+  } catch (error) {}
+  eventSource = null
+}
+
+async function handleHostRevoked(payload) {
+  setHostConflict({
+    errorCode: 'HOST_ACTIVE',
+    activeHost: {
+      clientId: payload && payload.replacedByClientId ? payload.replacedByClientId : '',
+      sessionId: payload && payload.replacedBySessionId ? payload.replacedBySessionId : '',
+      startedAt: payload && payload.at ? payload.at : null
+    }
+  })
+
+  await stopBroadcast({
+    skipUnregister: true,
+    preserveConflict: true,
+    statusText: 'Host session revoked. Click Take Over.',
+    statusTone: 'warn'
+  })
+}
+
+function ensureEventSource(options) {
+  const forceReset = Boolean(options && options.forceReset)
+  if (forceReset) {
+    resetEventSource()
+  }
+
   if (eventSource) return
 
-  eventSource = new EventSource(`/events?clientId=${encodeURIComponent(hostId)}`)
+  const nextEventSource = new EventSource(
+    `/events?clientId=${encodeURIComponent(hostId)}&sessionId=${encodeURIComponent(hostSessionId)}`
+  )
+  eventSource = nextEventSource
 
-  eventSource.addEventListener('listener-joined', async event => {
+  nextEventSource.addEventListener('error', () => {
+    if (eventSource !== nextEventSource) return
+    if (nextEventSource.readyState === EventSource.CLOSED) {
+      resetEventSource()
+    }
+  })
+
+  nextEventSource.addEventListener('listener-joined', async event => {
+    if (eventSource !== nextEventSource) return
     const payload = JSON.parse(event.data)
     if (!audioOnlyStream) return
     await createPeer(payload.clientId)
   })
 
-  eventSource.addEventListener('client-left', event => {
+  nextEventSource.addEventListener('client-left', event => {
+    if (eventSource !== nextEventSource) return
     const payload = JSON.parse(event.data)
     destroyPeer(payload.clientId)
   })
 
-  eventSource.addEventListener('participants', event => {
+  nextEventSource.addEventListener('participants', event => {
+    if (eventSource !== nextEventSource) return
     const payload = JSON.parse(event.data)
     updateParticipants(payload.participants)
   })
 
-  eventSource.addEventListener('diagnostics', event => {
+  nextEventSource.addEventListener('diagnostics', event => {
+    if (eventSource !== nextEventSource) return
     const payload = JSON.parse(event.data)
     remoteDiagnostics = payload.diagnostics || {}
     renderRemoteDiagnostics()
   })
 
-  eventSource.addEventListener('signal', async event => {
+  nextEventSource.addEventListener('host-revoked', event => {
+    if (eventSource !== nextEventSource) return
+    const payload = JSON.parse(event.data)
+    handleHostRevoked(payload).catch(error => {
+      setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+    })
+  })
+
+  nextEventSource.addEventListener('signal', async event => {
+    if (eventSource !== nextEventSource) return
     const payload = JSON.parse(event.data)
     let peer = peers.get(payload.from)
 
@@ -1136,6 +1326,7 @@ function ensureEventSource() {
 async function updateParticipantSettings(targetClientId, settings) {
   const response = await postJson('/api/participant-settings', {
     clientId: hostId,
+    sessionId: hostSessionId,
     targetClientId,
     settings
   })
@@ -1146,6 +1337,7 @@ async function updateParticipantSettings(targetClientId, settings) {
 async function sendListenerCommand(targetClientId, command) {
   await postJson('/api/listener-command', {
     clientId: hostId,
+    sessionId: hostSessionId,
     targetClientId,
     command
   })
@@ -1326,8 +1518,8 @@ async function createPeer(listenerId) {
   return peer
 }
 
-async function startBroadcast() {
-  ensureEventSource()
+async function startBroadcast(options) {
+  const takeover = Boolean(options && options.takeover)
   await refreshMediaDevices({ primeLabels: true })
 
   if (!sourceDeviceSelect.value) {
@@ -1357,22 +1549,19 @@ async function startBroadcast() {
   await optimizeAudioStream(audioOnlyStream)
   await sourceVisualizer.attachStream(audioOnlyStream)
 
-  const registration = await postJson('/api/register', {
-    clientId: hostId,
-    role: 'broadcaster',
-    settings: {
-      delayMs: clampDelay(monitorDelayInput.value),
-      channelMode: 'stereo'
-    }
-  })
+  const registration = await registerBroadcaster({ takeover })
 
   updateParticipants(registration.participants)
+  ensureEventSource({ forceReset: true })
+  clearHostConflict()
   await startLocalMonitor()
   renderDiagnostics()
 
   audioTracks.forEach(track => {
     track.addEventListener('ended', () => {
-      stopBroadcast()
+      stopBroadcast().catch(error => {
+        console.error(error)
+      })
     }, { once: true })
   })
 
@@ -1385,7 +1574,16 @@ async function startBroadcast() {
   }
 }
 
-async function stopBroadcast() {
+async function stopBroadcast(options) {
+  const skipUnregister = Boolean(options && options.skipUnregister)
+  const preserveConflict = Boolean(options && options.preserveConflict)
+  const statusText = options && Object.prototype.hasOwnProperty.call(options, 'statusText')
+    ? String(options.statusText)
+    : 'Idle'
+  const statusTone = options && Object.prototype.hasOwnProperty.call(options, 'statusTone')
+    ? options.statusTone
+    : null
+
   if (stopping) return
   stopping = true
 
@@ -1402,16 +1600,25 @@ async function stopBroadcast() {
   sourceVisualizer.clear('Waiting for audio')
   stopLocalMonitor()
 
-  try {
-    await postJson('/api/unregister', { clientId: hostId })
-  } catch (error) {
-    console.error(error)
+  if (!skipUnregister) {
+    try {
+      await postJson('/api/unregister', {
+        clientId: hostId,
+        sessionId: hostSessionId
+      })
+    } catch (error) {
+      console.error(error)
+    }
   }
+  resetEventSource()
 
   lastDiagnosticsText = ''
   updateParticipants([])
+  if (!preserveConflict) {
+    clearHostConflict()
+  }
   applyServerRunningState(serverRunning)
-  setStatus(statusBox, 'Idle')
+  setStatus(statusBox, statusText, statusTone)
   stopping = false
   renderDiagnostics()
 }
@@ -1433,7 +1640,10 @@ function unregisterHostOnUnload() {
   if (unloadUnregisterSent) return
   unloadUnregisterSent = true
 
-  const body = JSON.stringify({ clientId: hostId })
+  const body = JSON.stringify({
+    clientId: hostId,
+    sessionId: hostSessionId
+  })
 
   if (navigator.sendBeacon && typeof navigator.sendBeacon === 'function') {
     try {
@@ -1464,7 +1674,7 @@ startButton.addEventListener('click', async () => {
   setStatus(statusBox, 'Opening...')
 
   try {
-    await startBroadcast()
+    await startBroadcast({ takeover: false })
   } catch (error) {
     console.error(error)
     if (captureStream) {
@@ -1475,13 +1685,57 @@ startButton.addEventListener('click', async () => {
     sourceVisualizer.clear('Waiting for audio')
     stopLocalMonitor()
     applyServerRunningState(serverRunning)
-    setStatus(statusBox, error.message, 'warn')
+
+    if (error && error.status === 409 && error.payload && error.payload.errorCode === 'HOST_ACTIVE') {
+      setHostConflict(error.payload)
+      setStatus(statusBox, `${summarizeActiveHostConflict(error.payload)} Click Take Over to replace it.`, 'warn')
+      return
+    }
+
+    setStatus(statusBox, normalizeErrorMessage(error), 'warn')
   }
 })
 
 stopButton.addEventListener('click', () => {
-  stopBroadcast()
+  stopBroadcast().catch(error => {
+    setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+  })
 })
+
+if (takeoverButton) {
+  takeoverButton.addEventListener('click', async () => {
+    if (!hostConflict || stopping || !serverRunning) return
+    takeoverButton.disabled = true
+    startButton.disabled = true
+    setStatus(statusBox, 'Taking over host session...')
+
+    try {
+      await startBroadcast({ takeover: true })
+      setStatus(statusBox, 'Live')
+    } catch (error) {
+      console.error(error)
+      if (captureStream) {
+        captureStream.getTracks().forEach(track => track.stop())
+        captureStream = null
+      }
+      audioOnlyStream = null
+      sourceVisualizer.clear('Waiting for audio')
+      stopLocalMonitor()
+      applyServerRunningState(serverRunning)
+
+      if (error && error.status === 409 && error.payload && error.payload.errorCode === 'HOST_ACTIVE') {
+        setHostConflict(error.payload)
+        setStatus(statusBox, `${summarizeActiveHostConflict(error.payload)} Takeover failed.`, 'warn')
+        return
+      }
+
+      setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+      if (hostConflict) {
+        setHostConflict(hostConflict)
+      }
+    }
+  })
+}
 
 if (serverToggleButton) {
   serverToggleButton.addEventListener('click', async () => {
@@ -1498,6 +1752,7 @@ if (serverToggleButton) {
       const action = serverRunning ? 'stop' : 'start'
       const status = await postJson('/api/server-control', { action })
       renderLinks(status)
+      await refreshHostSessionConflict()
       setStatus(statusBox, status.serverRunning ? 'Server running.' : 'Server stopped.')
     } catch (error) {
       setStatus(statusBox, normalizeErrorMessage(error), 'warn')
@@ -1623,7 +1878,7 @@ presetButtons.forEach(button => {
 
 window.addEventListener('beforeunload', () => {
   unregisterHostOnUnload()
-  if (eventSource) eventSource.close()
+  resetEventSource()
   closeEqDrawer()
   stopLocalMonitor()
   sourceVisualizer.close().catch(() => {})
@@ -1645,6 +1900,9 @@ renderEqDrawer()
 applyServerRunningState(serverRunning)
 
 refreshStatusAndLinks()
+  .then(() => {
+    refreshHostSessionConflict().catch(() => {})
+  })
   .catch(error => {
     setStatus(statusBox, error.message, 'warn')
     renderDiagnostics()

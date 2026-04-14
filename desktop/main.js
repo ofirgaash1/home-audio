@@ -18,6 +18,7 @@ if (!app || !Tray || !Menu || !shell || !clipboard || !dialog || !nativeImage ||
 
 const APP_PORT = Number(process.env.PORT || 43117);
 const STATUS_URL = `http://127.0.0.1:${APP_PORT}/api/status`;
+const SERVER_CONTROL_URL = `http://127.0.0.1:${APP_PORT}/api/server-control`;
 
 let tray = null;
 let serverProcess = null;
@@ -42,6 +43,25 @@ async function wait(ms) {
 async function fetchStatus() {
   try {
     const response = await fetch(STATUS_URL, { method: "GET" });
+    if (!response.ok) return null;
+    const body = await response.json();
+    cachedStatus = body;
+    return body;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function postServerControl(action) {
+  try {
+    const response = await fetch(SERVER_CONTROL_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ action })
+    });
+
     if (!response.ok) return null;
     const body = await response.json();
     cachedStatus = body;
@@ -96,15 +116,38 @@ async function openListenerQr() {
   await shell.openExternal(qrUrl);
 }
 
-function stopServer() {
-  if (!serverProcess) return;
-  serverProcess.kill();
-  serverProcess = null;
-  cachedStatus = null;
+async function stopServer() {
+  if (serverProcess) {
+    serverProcess.kill();
+    serverProcess = null;
+  }
+
+  const status = await postServerControl("stop");
+  if (!status) {
+    cachedStatus = null;
+  }
+
   updateTrayMenu();
 }
 
 async function startServer() {
+  const existingStatus = await fetchStatus();
+  if (existingStatus) {
+    if (!existingStatus.serverRunning) {
+      const startedStatus = await postServerControl("start");
+      if (startedStatus && startedStatus.serverRunning) {
+        cachedStatus = startedStatus;
+      }
+    }
+
+    updateTrayMenu();
+    if (openingHostAfterStart) {
+      openingHostAfterStart = false;
+      await openHostPage();
+    }
+    return;
+  }
+
   if (serverProcess) return;
 
   const entryPath = getServerEntryPath();
@@ -126,8 +169,14 @@ async function startServer() {
 
   serverProcess.on("exit", () => {
     serverProcess = null;
-    cachedStatus = null;
-    updateTrayMenu();
+    fetchStatus()
+      .catch(() => {})
+      .finally(() => {
+        if (!cachedStatus || !cachedStatus.serverRunning) {
+          cachedStatus = null;
+        }
+        updateTrayMenu();
+      });
   });
 
   updateTrayMenu();
@@ -150,7 +199,7 @@ async function startServer() {
 
 function updateTrayMenu() {
   if (!tray) return;
-  const running = Boolean(serverProcess);
+  const running = Boolean(serverProcess) || Boolean(cachedStatus && cachedStatus.serverRunning);
   const hostPage = getHostPageUrl();
   const listenLink = getPreferredListenUrl();
 
@@ -182,7 +231,9 @@ function updateTrayMenu() {
     {
       label: "Stop Server",
       enabled: running,
-      click: () => stopServer()
+      click: () => {
+        stopServer().catch(() => {});
+      }
     },
     { type: "separator" },
     {
@@ -206,8 +257,11 @@ function updateTrayMenu() {
     {
       label: "Quit",
       click: () => {
-        stopServer();
-        app.quit();
+        stopServer()
+          .catch(() => {})
+          .finally(() => {
+            app.quit();
+          });
       }
     }
   ]);
@@ -257,7 +311,7 @@ app.on("window-all-closed", event => {
 });
 
 app.on("before-quit", () => {
-  stopServer();
+  stopServer().catch(() => {});
 });
 
 app.whenReady().then(() => {

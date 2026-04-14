@@ -16,6 +16,9 @@ const AUTO_JOIN_STORAGE_KEY = 'home-audio.listener-autojoin.v1'
 const MAX_RECONNECT_DELAY_MS = 20000
 const RECONNECT_BASE_DELAY_MS = 1200
 const AUTO_JOIN_DEFAULT = true
+const MEDIA_SESSION_ARTWORK_URI = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="96" height="96" rx="20" fill="#1f6f59"/><path fill="#f7f1e4" d="M22 53h8l6-16 10 30 10-22 6 8h8"/></svg>'
+)}`
 const listenerId = getPersistentListenerId()
 const AudioContextClass = window.AudioContext || window.webkitAudioContext
 
@@ -45,6 +48,13 @@ let reconnectAttempt = 0
 let autoJoinEnabled = readAutoJoinPreference()
 let unloadInProgress = false
 let lastDiagnosticsText = ''
+let mediaSessionConfigured = false
+let mediaSessionPlaybackState = 'unsupported'
+const mediaSessionActionHandlers = {
+  play: false,
+  pause: false,
+  stop: false
+}
 let receiverStats = {
   bytesReceived: 'n/a',
   packetsReceived: 'n/a',
@@ -135,6 +145,30 @@ function wait(ms) {
 function hasKnownBroadcaster() {
   if (broadcasterId) return true
   return participants.some(participant => participant.role === 'broadcaster')
+}
+
+function syncJoinedPresenceStatus() {
+  if (!joined) return
+  if (joining) return
+  if (mediaReady) return
+
+  const currentStatus = statusBox.textContent || ''
+  if (/^Reconnecting/i.test(currentStatus)) {
+    return
+  }
+
+  if (/^Tap play\.|^Link failed/i.test(currentStatus)) {
+    return
+  }
+
+  if (!hasKnownBroadcaster()) {
+    setStatus(statusBox, 'Waiting for host', 'warn')
+    return
+  }
+
+  if (!peer) {
+    setStatus(statusBox, 'Joined')
+  }
 }
 
 function resetEventSource() {
@@ -575,6 +609,11 @@ function getDiagnosticsText() {
     `browser.maxTouchPoints=${typeof navigator.maxTouchPoints === 'number' ? navigator.maxTouchPoints : 'n/a'}`,
     `capabilities.audioContext=${AudioContextClass ? 'yes' : 'no'}`,
     `capabilities.mediaSession=${'mediaSession' in navigator ? 'yes' : 'no'}`,
+    `mediaSession.configured=${mediaSessionConfigured ? 'yes' : 'no'}`,
+    `mediaSession.playbackState=${mediaSessionPlaybackState}`,
+    `mediaSession.action.play=${mediaSessionActionHandlers.play ? 'yes' : 'no'}`,
+    `mediaSession.action.pause=${mediaSessionActionHandlers.pause ? 'yes' : 'no'}`,
+    `mediaSession.action.stop=${mediaSessionActionHandlers.stop ? 'yes' : 'no'}`,
     `capabilities.wakeLock=${'wakeLock' in navigator ? 'yes' : 'no'}`,
     `capabilities.createMediaElementSource=${AudioContextClass && typeof AudioContextClass.prototype.createMediaElementSource === 'function' ? 'yes' : 'no'}`,
     `capabilities.createMediaStreamSource=${AudioContextClass && typeof AudioContextClass.prototype.createMediaStreamSource === 'function' ? 'yes' : 'no'}`,
@@ -682,6 +721,8 @@ function updateParticipants(nextParticipants) {
   if (!usingDirectPlaybackFallback) {
     applySelfAudioSettings()
   }
+  syncJoinedPresenceStatus()
+  syncMediaSessionState()
   renderDiagnostics()
 }
 
@@ -716,35 +757,125 @@ function releaseWakeLock() {
   wakeLock = null
 }
 
+function setMediaSessionPlaybackState(nextState) {
+  if (!('mediaSession' in navigator)) return
+
+  const normalizedState = nextState === 'playing' || nextState === 'paused'
+    ? nextState
+    : 'none'
+
+  try {
+    navigator.mediaSession.playbackState = normalizedState
+    mediaSessionPlaybackState = normalizedState
+  } catch (error) {
+    mediaSessionPlaybackState = 'unsupported'
+  }
+}
+
+async function handleMediaSessionPlay() {
+  try {
+    if (playbackProcessor && !usingDirectPlaybackFallback) {
+      await playbackProcessor.context.resume()
+    }
+    await player.play()
+    mediaReady = true
+  } catch (error) {}
+
+  syncJoinedPresenceStatus()
+  syncMediaSessionState()
+  renderDiagnostics()
+}
+
+function handleMediaSessionPause() {
+  if (playbackProcessor && !usingDirectPlaybackFallback) {
+    playbackProcessor.context.suspend().catch(() => {})
+  }
+  player.pause()
+  mediaReady = false
+  syncJoinedPresenceStatus()
+  syncMediaSessionState()
+  renderDiagnostics()
+}
+
+function handleMediaSessionStop() {
+  if (playbackProcessor && !usingDirectPlaybackFallback) {
+    playbackProcessor.context.suspend().catch(() => {})
+  }
+  player.pause()
+  mediaReady = false
+  syncJoinedPresenceStatus()
+  syncMediaSessionState()
+  renderDiagnostics()
+}
+
 function configureMediaSession() {
   if (!('mediaSession' in navigator)) return
 
-  try {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: 'LAN Audio Relay',
-      artist: 'Home Audio'
-    })
-
-    navigator.mediaSession.setActionHandler('play', async () => {
-      try {
-        if (playbackProcessor && !usingDirectPlaybackFallback) {
-          await playbackProcessor.context.resume()
-          return
-        }
-        await player.play()
-      } catch (error) {}
-    })
-
-    navigator.mediaSession.setActionHandler('pause', () => {
-      if (playbackProcessor && !usingDirectPlaybackFallback) {
-        playbackProcessor.context.suspend().catch(() => {})
-        return
-      }
-      player.pause()
-    })
-  } catch (error) {
-    console.debug('Media Session unavailable:', error)
+  if (typeof MediaMetadata === 'function') {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'LAN Audio Relay',
+        artist: 'Home Audio',
+        album: 'LAN',
+        artwork: [
+          {
+            src: MEDIA_SESSION_ARTWORK_URI,
+            sizes: '96x96',
+            type: 'image/svg+xml'
+          }
+        ]
+      })
+    } catch (error) {}
   }
+
+  if (!mediaSessionConfigured) {
+    try {
+      navigator.mediaSession.setActionHandler('play', () => {
+        handleMediaSessionPlay().catch(() => {})
+      })
+      mediaSessionActionHandlers.play = true
+    } catch (error) {
+      mediaSessionActionHandlers.play = false
+    }
+
+    try {
+      navigator.mediaSession.setActionHandler('pause', () => {
+        handleMediaSessionPause()
+      })
+      mediaSessionActionHandlers.pause = true
+    } catch (error) {
+      mediaSessionActionHandlers.pause = false
+    }
+
+    try {
+      navigator.mediaSession.setActionHandler('stop', () => {
+        handleMediaSessionStop()
+      })
+      mediaSessionActionHandlers.stop = true
+    } catch (error) {
+      mediaSessionActionHandlers.stop = false
+    }
+
+    mediaSessionConfigured = true
+  }
+
+}
+
+function syncMediaSessionState() {
+  if (!('mediaSession' in navigator)) return
+
+  if (joined || remoteStream || broadcasterId) {
+    configureMediaSession()
+  } else {
+    try {
+      navigator.mediaSession.metadata = null
+    } catch (error) {}
+  }
+
+  const nextState = mediaReady && !player.paused
+    ? 'playing'
+    : (joined && (hasKnownBroadcaster() || Boolean(player.srcObject)) ? 'paused' : 'none')
+  setMediaSessionPlaybackState(nextState)
 }
 
 function destroyPeer() {
@@ -778,6 +909,8 @@ async function stopPlayback(options) {
 
   playbackProcessor = null
   playbackVisualizer.clear('Waiting for audio')
+  syncJoinedPresenceStatus()
+  syncMediaSessionState()
   renderDiagnostics()
 }
 
@@ -824,9 +957,11 @@ async function startPlayback(stream, sessionId) {
     assertCurrentPlaybackSession(sessionId)
     mediaReady = true
     setStatus(statusBox, 'Playing')
+    syncMediaSessionState()
     renderDiagnostics()
   } catch (error) {
     setStatus(statusBox, 'Tap play.', 'warn')
+    syncMediaSessionState()
     renderDiagnostics()
   }
 }
@@ -851,9 +986,11 @@ async function startDirectPlaybackFallback(stream, reason, sessionId) {
     assertCurrentPlaybackSession(sessionId)
     mediaReady = true
     setStatus(statusBox, preferredDirectMode ? 'Direct' : 'Fallback', preferredDirectMode ? null : 'warn')
+    syncMediaSessionState()
     renderDiagnostics()
   } catch (error) {
     setStatus(statusBox, 'Tap play.', 'warn')
+    syncMediaSessionState()
     renderDiagnostics()
   }
 }
@@ -983,6 +1120,7 @@ function ensureEventSource(options) {
     broadcasterId = null
     lastDiagnosticsText = ''
     setStatus(statusBox, 'Waiting for host', 'warn')
+    syncMediaSessionState()
     renderDiagnostics()
   })
 
@@ -1107,8 +1245,9 @@ async function joinAudio() {
   joinButton.disabled = true
   leaveButton.disabled = false
   joined = true
-  setStatus(statusBox, 'Joined')
+  syncJoinedPresenceStatus()
   await requestWakeLock()
+  syncMediaSessionState()
   renderDiagnostics()
   await pushDiagnostics()
 }
@@ -1190,6 +1329,7 @@ async function leaveAudio(options) {
   joinButton.disabled = false
   leaveButton.disabled = true
   setStatus(statusBox, 'Idle')
+  syncMediaSessionState()
   renderDiagnostics()
 }
 
@@ -1218,6 +1358,7 @@ leaveButton.addEventListener('click', () => {
     lastPlayerErrorCode = player.error && typeof player.error.code === 'number'
       ? String(player.error.code)
       : 'n/a'
+    syncMediaSessionState()
     renderDiagnostics()
   })
 })
@@ -1244,8 +1385,11 @@ document.addEventListener('visibilitychange', () => {
       }
     }
 
+    syncMediaSessionState()
     renderDiagnostics()
   }
+
+  syncMediaSessionState()
 })
 
 window.addEventListener('beforeunload', () => {

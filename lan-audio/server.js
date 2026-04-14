@@ -27,9 +27,23 @@ const SSE_DISCONNECT_GRACE_MS = Math.max(
   0,
   Number(process.env.HOME_AUDIO_SSE_DISCONNECT_GRACE_MS || 60000) || 60000
 )
+const SSE_BROADCASTER_DISCONNECT_GRACE_MS = Math.max(
+  0,
+  Number(process.env.HOME_AUDIO_SSE_BROADCASTER_DISCONNECT_GRACE_MS || 3000) || 3000
+)
+const STOP_WITHOUT_HOST_MS = Math.max(
+  0,
+  Number(process.env.HOME_AUDIO_STOP_WITHOUT_HOST_MS || 30000) || 30000
+)
 const DELAY_MIN_MS = 0
 const DELAY_MAX_MS = 300
 const DELAY_STEP_MS = 5
+
+if (typeof process.send === 'function') {
+  process.on('disconnect', () => {
+    process.exit(0)
+  })
+}
 
 function ensureDebugLogDirectory() {
   fs.mkdirSync(path.dirname(DEBUG_LOG_PATH), { recursive: true })
@@ -128,6 +142,10 @@ function createState() {
   return {
     serverRunning: true,
     broadcasterId: null,
+    broadcasterSessionId: '',
+    broadcasterSessionStartedAt: null,
+    noHostStopTimer: null,
+    noHostStopAt: null,
     clients: new Map(),
     startedAt: new Date().toISOString(),
     nextDebugEventId: 1,
@@ -183,6 +201,11 @@ function parseDiagnosticsSummary(text) {
     'directFallback',
     'processedPlaybackPath',
     'listenerContext.state',
+    'mediaSession.configured',
+    'mediaSession.playbackState',
+    'mediaSession.action.play',
+    'mediaSession.action.pause',
+    'mediaSession.action.stop',
     'processor.context.state',
     'processor.context.sampleRate',
     'processor.level',
@@ -293,6 +316,70 @@ function clearDisconnectTimer(client) {
   client.disconnectedAt = null
 }
 
+function clearNoHostStopTimer(state) {
+  if (!state || !state.noHostStopTimer) {
+    if (state) {
+      state.noHostStopAt = null
+    }
+    return
+  }
+
+  clearTimeout(state.noHostStopTimer)
+  state.noHostStopTimer = null
+  state.noHostStopAt = null
+}
+
+function scheduleStopWithoutHost(state) {
+  if (!state || !state.serverRunning) return
+  if (STOP_WITHOUT_HOST_MS <= 0) return
+  if (state.broadcasterId) return
+
+  clearNoHostStopTimer(state)
+  state.noHostStopAt = new Date(Date.now() + STOP_WITHOUT_HOST_MS).toISOString()
+
+  state.noHostStopTimer = setTimeout(() => {
+    state.noHostStopTimer = null
+    state.noHostStopAt = null
+
+    if (!state.serverRunning || state.broadcasterId) {
+      return
+    }
+
+    const changed = stopService(state, 'no-host-timeout')
+    if (changed) {
+      recordDebugEvent(state, 'server-control', {
+        action: 'auto-stop-no-host',
+        serverRunning: state.serverRunning
+      })
+    }
+  }, STOP_WITHOUT_HOST_MS)
+}
+
+function normalizeSessionId(value) {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  return trimmed || ''
+}
+
+function getActiveBroadcasterSummary(state) {
+  if (!state.broadcasterId) return null
+  const active = state.clients.get(state.broadcasterId)
+  return {
+    clientId: state.broadcasterId,
+    sessionId: state.broadcasterSessionId || '',
+    connected: Boolean(active && active.res),
+    startedAt: state.broadcasterSessionStartedAt || null
+  }
+}
+
+function isActiveBroadcasterSession(state, clientId, sessionId) {
+  const normalizedSessionId = normalizeSessionId(sessionId)
+  if (!clientId || !normalizedSessionId) return false
+  if (state.broadcasterId !== clientId) return false
+  if (!state.broadcasterSessionId) return false
+  return state.broadcasterSessionId === normalizedSessionId
+}
+
 function applyClientSettings(client, role, nextSettings) {
   const base = client.settings || getDefaultSettings(role)
   const merged = {
@@ -384,9 +471,13 @@ function getDebugStateSnapshot(state, activePort) {
       host: HOST,
       port: activePort,
       startedAt: state.startedAt,
-      debugLogPath: DEBUG_LOG_PATH
+      debugLogPath: DEBUG_LOG_PATH,
+      stopWithoutHostMs: STOP_WITHOUT_HOST_MS,
+      noHostStopAt: state.noHostStopAt
     },
     broadcasterId: state.broadcasterId,
+    broadcasterSessionId: state.broadcasterSessionId || '',
+    broadcasterSessionStartedAt: state.broadcasterSessionStartedAt,
     participants: getParticipantsSnapshot(state),
     clients: Array.from(state.clients.values())
       .map(client => getClientDebugSnapshot(client, labelMap))
@@ -448,6 +539,7 @@ function listListenerIds(state) {
 function stopService(state, reason) {
   if (!state.serverRunning) return false
   state.serverRunning = false
+  clearNoHostStopTimer(state)
 
   const activeClientIds = Array.from(state.clients.values())
     .filter(client => client.role)
@@ -474,6 +566,7 @@ function stopService(state, reason) {
 function startService(state) {
   if (state.serverRunning) return false
   state.serverRunning = true
+  clearNoHostStopTimer(state)
   return true
 }
 
@@ -500,6 +593,8 @@ function unregisterClient(state, clientId, reason) {
 
   if (client.role === 'broadcaster' && state.broadcasterId === clientId) {
     state.broadcasterId = null
+    state.broadcasterSessionId = ''
+    state.broadcasterSessionStartedAt = null
     state.clients.forEach(otherClient => {
       if (otherClient.id !== clientId && otherClient.role === 'listener') {
         sendEvent(otherClient, 'host-left', { broadcasterId: clientId })
@@ -519,15 +614,35 @@ function unregisterClient(state, clientId, reason) {
   client.settings = null
   client.diagnostics = ''
   client.diagnosticsAt = null
+  if (previousRole === 'broadcaster') {
+    scheduleStopWithoutHost(state)
+  }
   broadcastParticipants(state)
   broadcastDiagnostics(state)
 }
 
 function attachSse(state, req, res, parsedUrl) {
   const clientId = parsedUrl.searchParams.get('clientId')
+  const sessionId = normalizeSessionId(parsedUrl.searchParams.get('sessionId'))
   if (!clientId) {
     sendJson(res, 400, { error: 'Missing clientId' })
     return
+  }
+
+  if (clientId === state.broadcasterId) {
+    if (!sessionId) {
+      sendJson(res, 403, { error: 'Missing host sessionId' })
+      return
+    }
+
+    if (!isActiveBroadcasterSession(state, clientId, sessionId)) {
+      sendJson(res, 403, {
+        error: 'Host session is not active',
+        errorCode: 'HOST_SESSION_INACTIVE',
+        activeHost: getActiveBroadcasterSummary(state)
+      })
+      return
+    }
   }
 
   const client = getOrCreateClient(state, clientId)
@@ -582,8 +697,11 @@ function attachSse(state, req, res, parsedUrl) {
 
     currentClient.res = null
     currentClient.disconnectedAt = new Date().toISOString()
+    const disconnectGraceMs = currentClient.role === 'broadcaster'
+      ? SSE_BROADCASTER_DISCONNECT_GRACE_MS
+      : SSE_DISCONNECT_GRACE_MS
 
-    if (SSE_DISCONNECT_GRACE_MS <= 0) {
+    if (disconnectGraceMs <= 0) {
       unregisterClient(state, clientId, 'sse-close')
       return
     }
@@ -593,7 +711,7 @@ function attachSse(state, req, res, parsedUrl) {
       if (!latestClient || latestClient.res) return
       latestClient.disconnectTimer = null
       unregisterClient(state, clientId, 'sse-timeout')
-    }, SSE_DISCONNECT_GRACE_MS)
+    }, disconnectGraceMs)
   })
 }
 
@@ -643,17 +761,69 @@ async function handleRegister(state, req, res) {
   client.lastDirectFallbackStatus = ''
 
   if (role === 'broadcaster') {
-    if (state.broadcasterId && state.broadcasterId !== clientId) {
-      sendJson(res, 409, { error: 'Another broadcaster is already active' })
+    const sessionId = normalizeSessionId(body.sessionId)
+    const takeover = Boolean(body.takeover)
+
+    if (!sessionId) {
+      sendJson(res, 400, { error: 'Missing sessionId for broadcaster registration' })
       return
     }
 
+    const hasActiveBroadcaster = Boolean(state.broadcasterId)
+    const sameActiveSession = isActiveBroadcasterSession(state, clientId, sessionId)
+
+    if (hasActiveBroadcaster && !sameActiveSession) {
+      if (!takeover) {
+        sendJson(res, 409, {
+          error: 'Another host session is already active',
+          errorCode: 'HOST_ACTIVE',
+          canTakeover: true,
+          activeHost: getActiveBroadcasterSummary(state)
+        })
+        return
+      }
+
+      const previousBroadcasterId = state.broadcasterId
+      const previousBroadcaster = previousBroadcasterId
+        ? state.clients.get(previousBroadcasterId)
+        : null
+      const previousResponse = previousBroadcaster && previousBroadcaster.res
+        ? previousBroadcaster.res
+        : null
+
+      if (previousBroadcaster && previousResponse) {
+        sendEvent(previousBroadcaster, 'host-revoked', {
+          reason: 'takeover',
+          replacedByClientId: clientId,
+          replacedBySessionId: sessionId,
+          previousClientId: previousBroadcasterId,
+          previousSessionId: state.broadcasterSessionId || '',
+          at: new Date().toISOString()
+        })
+      }
+
+      if (previousBroadcasterId) {
+        unregisterClient(state, previousBroadcasterId, 'host-takeover')
+      }
+
+      if (previousResponse) {
+        try {
+          previousResponse.end()
+        } catch (error) {}
+      }
+    }
+
     state.broadcasterId = clientId
+    state.broadcasterSessionId = sessionId
+    state.broadcasterSessionStartedAt = new Date().toISOString()
+    clearNoHostStopTimer(state)
     client.role = 'broadcaster'
     applyClientSettings(client, role, body.settings)
     recordDebugEvent(state, 'register', {
       clientId,
       role,
+      sessionId,
+      takeover,
       settings: client.settings
     })
 
@@ -663,6 +833,7 @@ async function handleRegister(state, req, res) {
       ok: true,
       role,
       clientId,
+      sessionId,
       listeners: listListenerIds(state),
       participants
     })
@@ -705,6 +876,19 @@ async function handleUnregister(state, req, res) {
     return
   }
 
+  const sessionId = normalizeSessionId(body.sessionId)
+  if (body.clientId === state.broadcasterId && state.broadcasterSessionId) {
+    if (!sessionId || sessionId !== state.broadcasterSessionId) {
+      sendJson(res, 200, {
+        ok: true,
+        ignored: true,
+        reason: 'stale-host-session',
+        activeHost: getActiveBroadcasterSummary(state)
+      })
+      return
+    }
+  }
+
   unregisterClient(state, body.clientId, 'api-unregister')
   sendJson(res, 200, { ok: true })
 }
@@ -714,10 +898,24 @@ async function handleSignal(state, req, res) {
   const from = body.from
   const to = body.to
   const signal = body.signal
+  const sessionId = normalizeSessionId(body.sessionId)
 
   if (!from || !to || !signal) {
     sendJson(res, 400, { error: 'Missing from, to, or signal' })
     return
+  }
+
+  const sender = state.clients.get(from)
+  const isBroadcasterSignal = from === state.broadcasterId ||
+    Boolean(sender && sender.role === 'broadcaster')
+  if (isBroadcasterSignal) {
+    if (!isActiveBroadcasterSession(state, from, sessionId)) {
+      sendJson(res, 403, {
+        error: 'Only active host session may send broadcaster signals',
+        errorCode: 'HOST_SESSION_INACTIVE'
+      })
+      return
+    }
   }
 
   const target = state.clients.get(to)
@@ -730,6 +928,7 @@ async function handleSignal(state, req, res) {
   recordDebugEvent(state, 'signal', {
     from,
     to,
+    sessionId: isBroadcasterSignal ? sessionId : '',
     signalType: signal.type || (signal.candidate ? 'candidate' : 'unknown')
   })
   sendEvent(target, 'signal', { from, signal })
@@ -739,9 +938,20 @@ async function handleSignal(state, req, res) {
 async function handleParticipantSettings(state, req, res) {
   const body = await readBody(req)
   const targetClientId = body.targetClientId
+  const actorClientId = body.clientId || null
+  const actorSessionId = normalizeSessionId(body.sessionId)
 
   if (!targetClientId || !body.settings) {
     sendJson(res, 400, { error: 'Missing targetClientId or settings' })
+    return
+  }
+
+  const actor = actorClientId ? state.clients.get(actorClientId) : null
+  if (actor && actor.role === 'broadcaster' && !isActiveBroadcasterSession(state, actorClientId, actorSessionId)) {
+    sendJson(res, 403, {
+      error: 'Only active host session may update settings',
+      errorCode: 'HOST_SESSION_INACTIVE'
+    })
     return
   }
 
@@ -754,7 +964,8 @@ async function handleParticipantSettings(state, req, res) {
   applyClientSettings(target, target.role, body.settings)
   state.counters.participantSettingsUpdates += 1
   recordDebugEvent(state, 'participant-settings', {
-    actorClientId: body.clientId || null,
+    actorClientId,
+    actorSessionId: actor && actor.role === 'broadcaster' ? actorSessionId : '',
     targetClientId,
     role: target.role,
     settings: target.settings
@@ -766,6 +977,7 @@ async function handleParticipantSettings(state, req, res) {
 async function handleListenerCommand(state, req, res) {
   const body = await readBody(req)
   const actorClientId = body.clientId
+  const actorSessionId = normalizeSessionId(body.sessionId)
   const targetClientId = body.targetClientId
   const command = typeof body.command === 'string'
     ? body.command.trim().toLowerCase()
@@ -780,6 +992,14 @@ async function handleListenerCommand(state, req, res) {
   const actor = state.clients.get(actorClientId)
   if (!actor || actor.role !== 'broadcaster' || state.broadcasterId !== actorClientId) {
     sendJson(res, 403, { error: 'Only active host may issue listener commands' })
+    return
+  }
+
+  if (!isActiveBroadcasterSession(state, actorClientId, actorSessionId)) {
+    sendJson(res, 403, {
+      error: 'Only active host session may issue listener commands',
+      errorCode: 'HOST_SESSION_INACTIVE'
+    })
     return
   }
 
@@ -808,6 +1028,7 @@ async function handleListenerCommand(state, req, res) {
 
   recordDebugEvent(state, 'listener-command', {
     actorClientId,
+    actorSessionId,
     targetClientId,
     deliveredCount: activeTargets.length,
     command
@@ -1053,6 +1274,20 @@ function createServer() {
 function startServer() {
   ensureDebugLogDirectory()
   const server = createServer()
+
+  server.on('error', error => {
+    if (error && error.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use.`)
+      console.error('Another Home Audio process is already running.')
+      console.error(`If http://localhost:${PORT}/host shows "Start server", start it there (do not launch another node instance).`)
+      console.error(`Otherwise stop the existing process using port ${PORT}, or run with PORT=<new-port>.`)
+      process.exit(1)
+      return
+    }
+
+    console.error(error)
+    process.exit(1)
+  })
 
   server.listen(PORT, HOST, () => {
     const address = server.address()
