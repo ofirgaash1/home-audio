@@ -1284,7 +1284,21 @@ function ensureEventSource(options) {
   nextEventSource.addEventListener('client-left', event => {
     if (eventSource !== nextEventSource) return
     const payload = JSON.parse(event.data)
-    destroyPeer(payload.clientId)
+    const peer = peers.get(payload.clientId)
+    if (!peer || !peer._pc) {
+      destroyPeer(payload.clientId)
+      return
+    }
+
+    const connectionState = peer._pc.connectionState || ''
+    if (connectionState === 'failed' || connectionState === 'closed' || connectionState === 'disconnected') {
+      destroyPeer(payload.clientId)
+      return
+    }
+
+    // A listener can temporarily lose the SSE control channel while WebRTC audio is still healthy,
+    // especially when mobile browsers background the tab. Keep the peer alive in that case.
+    renderDiagnostics()
   })
 
   nextEventSource.addEventListener('participants', event => {

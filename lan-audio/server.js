@@ -25,7 +25,7 @@ const SSE_HEARTBEAT_MS = Math.max(
 )
 const SSE_DISCONNECT_GRACE_MS = Math.max(
   0,
-  Number(process.env.HOME_AUDIO_SSE_DISCONNECT_GRACE_MS || 60000) || 60000
+  Number(process.env.HOME_AUDIO_SSE_DISCONNECT_GRACE_MS || 900000) || 900000
 )
 const SSE_BROADCASTER_DISCONNECT_GRACE_MS = Math.max(
   0,
@@ -187,6 +187,11 @@ function decodeQuotedValue(value) {
     return value.slice(1, -1)
   }
   return value
+}
+
+function summarizeUserAgent(value) {
+  if (typeof value !== 'string') return ''
+  return value.trim().slice(0, 220)
 }
 
 function parseDiagnosticsSummary(text) {
@@ -646,6 +651,8 @@ function attachSse(state, req, res, parsedUrl) {
   }
 
   const client = getOrCreateClient(state, clientId)
+  const hadDisconnectGap = Boolean(client.disconnectTimer || client.disconnectedAt)
+  const previousDisconnectedAt = client.disconnectedAt
   clearDisconnectTimer(client)
 
   if (client.res && client.res !== res) {
@@ -655,6 +662,16 @@ function attachSse(state, req, res, parsedUrl) {
   }
 
   client.res = res
+
+  recordDebugEvent(state, 'sse-connected', {
+    clientId,
+    role: client.role || null,
+    hadDisconnectGap,
+    previousDisconnectedAt: previousDisconnectedAt || null,
+    sessionId: clientId === state.broadcasterId ? sessionId : '',
+    remoteAddress: (req.socket && req.socket.remoteAddress) || '',
+    userAgent: summarizeUserAgent(req.headers['user-agent'])
+  })
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -701,6 +718,13 @@ function attachSse(state, req, res, parsedUrl) {
       ? SSE_BROADCASTER_DISCONNECT_GRACE_MS
       : SSE_DISCONNECT_GRACE_MS
 
+    recordDebugEvent(state, 'sse-disconnected', {
+      clientId,
+      role: currentClient.role || null,
+      disconnectedAt: currentClient.disconnectedAt,
+      disconnectGraceMs
+    })
+
     if (disconnectGraceMs <= 0) {
       unregisterClient(state, clientId, 'sse-close')
       return
@@ -710,6 +734,11 @@ function attachSse(state, req, res, parsedUrl) {
       const latestClient = state.clients.get(clientId)
       if (!latestClient || latestClient.res) return
       latestClient.disconnectTimer = null
+      recordDebugEvent(state, 'sse-timeout', {
+        clientId,
+        role: latestClient.role || null,
+        disconnectedAt: latestClient.disconnectedAt
+      })
       unregisterClient(state, clientId, 'sse-timeout')
     }, disconnectGraceMs)
   })

@@ -10,6 +10,12 @@ npm run lan-audio
 
 Main app files live in `lan-audio/`.
 
+For live terminal diagnostics/control (including listener refresh/rejoin/leave and server restart), use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action status
+```
+
 ## Desktop App (No Terminal For End Users)
 
 The repo now includes a Windows desktop wrapper with a tray menu that:

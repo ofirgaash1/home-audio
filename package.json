@@ -7,6 +7,9 @@
   "license": "MIT",
   "scripts": {
     "lan-audio": "node lan-audio/server.js",
+    "lan-console:status": "powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action status",
+    "lan-console:watch": "powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action watch",
+    "lan-console:events": "powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action events",
     "test:eq-ui": "node lan-audio/ui-tests/eq-drag-host.mjs",
     "desktop:dev": "electron .",
     "desktop:dist": "electron-builder --win nsis"

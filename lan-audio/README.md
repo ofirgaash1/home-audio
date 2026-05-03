@@ -13,6 +13,21 @@ It now supports a better VB-CABLE path: capture `CABLE Output` as an input devic
 npm run lan-audio
 ```
 
+## Live terminal control and diagnostics
+
+Use the live console script for status/watch/events, listener commands, and restart:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action status
+powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action watch
+powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action events
+powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action refresh-all
+powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action rejoin -ListenerId listener-k2891nmq
+powershell -ExecutionPolicy Bypass -File lan-audio/live-console.ps1 -Action restart
+```
+
+`watch-debug.ps1` remains available for a focused debug-state view.
+
 ## Important limitation
 
 The PC host page should be opened on `localhost`, not on the LAN IP, because browser media permissions are tied to secure or trustworthy origins.
