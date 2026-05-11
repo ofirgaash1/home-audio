@@ -48,6 +48,8 @@ let reconnectAttempt = 0
 let autoJoinEnabled = readAutoJoinPreference()
 let unloadInProgress = false
 let lastDiagnosticsText = ''
+let missingMediaSeconds = 0
+let lastMissingMediaRecoveryAt = 0
 let mediaSessionConfigured = false
 let mediaSessionPlaybackState = 'unsupported'
 const mediaSessionActionHandlers = {
@@ -131,6 +133,24 @@ function normalizeErrorMessage(error) {
   return String(error)
 }
 
+function isTargetNotConnectedError(error) {
+  return /Target client is not connected/i.test(normalizeErrorMessage(error))
+}
+
+function isPeerConnectionHealthy(peerInstance) {
+  if (!peerInstance || peerInstance.destroyed) return false
+  const pc = peerInstance._pc
+  if (!pc) return false
+  const connectionState = String(pc.connectionState || '')
+  const iceConnectionState = String(pc.iceConnectionState || '')
+  const failedStates = ['failed', 'closed', 'disconnected']
+  if (failedStates.includes(connectionState) || failedStates.includes(iceConnectionState)) {
+    return false
+  }
+  return connectionState === 'connected' || connectionState === 'connecting' ||
+    iceConnectionState === 'connected' || iceConnectionState === 'completed' || iceConnectionState === 'checking'
+}
+
 function summarizeErrorStack(error) {
   if (!error || !error.stack) return 'n/a'
   return String(error.stack).replace(/\s+/g, ' ').slice(0, 240)
@@ -145,6 +165,13 @@ function wait(ms) {
 function hasKnownBroadcaster() {
   if (broadcasterId) return true
   return participants.some(participant => participant.role === 'broadcaster')
+}
+
+function hasHealthyPeerConnection() {
+  if (!peer || !peer._pc) return false
+  const state = String(peer._pc.connectionState || '').toLowerCase()
+  if (state === 'connected') return true
+  return false
 }
 
 function syncJoinedPresenceStatus() {
@@ -249,8 +276,7 @@ async function postSignalWithRetry(from, to, signal) {
       return
     } catch (error) {
       lastError = error
-      const message = normalizeErrorMessage(error)
-      const shouldRetry = /Target client is not connected/i.test(message)
+      const shouldRetry = isTargetNotConnectedError(error)
 
       if (!shouldRetry || attempt === attempts) {
         throw error
@@ -685,6 +711,20 @@ function startDiagnostics() {
         console.debug('Receiver stats update failed:', error)
       })
       .finally(() => {
+        if (joined && shouldAutoJoin() && !joining && !mediaReady && hasKnownBroadcaster()) {
+          missingMediaSeconds += 1
+          const now = Date.now()
+          if (missingMediaSeconds >= 5 && now - lastMissingMediaRecoveryAt >= 12000) {
+            lastMissingMediaRecoveryAt = now
+            ensureJoined({
+              forceRegister: true,
+              reason: 'stuck without media'
+            }).catch(() => {})
+          }
+        } else {
+          missingMediaSeconds = 0
+        }
+
         renderDiagnostics()
         pushDiagnostics().catch(() => {})
       })
@@ -1110,6 +1150,17 @@ function ensureEventSource(options) {
       resetEventSource()
     }
 
+    // If media is healthy, only recover the control channel and avoid full unregister/rejoin churn.
+    if (joined && mediaReady && hasHealthyPeerConnection()) {
+      if (!sourceClosed) {
+        resetEventSource()
+      }
+      window.setTimeout(() => {
+        ensureEventSource()
+      }, 250)
+      return
+    }
+
     if (joined && !hasKnownBroadcaster()) return
     scheduleReconnect(sourceClosed ? 'events closed' : 'events reconnecting', sourceClosed)
   })
@@ -1142,6 +1193,10 @@ function ensureEventSource(options) {
     const payload = JSON.parse(event.data)
 
     if (broadcasterId && broadcasterId !== payload.from) {
+      if (mediaReady && isPeerConnectionHealthy(peer)) {
+        renderDiagnostics()
+        return
+      }
       destroyPeer()
       await stopPlayback().catch(() => {})
     }
@@ -1172,7 +1227,15 @@ function createPeer(hostClientId) {
     try {
       await postSignalWithRetry(listenerId, hostClientId, signal)
     } catch (error) {
-      setStatus(statusBox, error.message, 'warn')
+      const message = normalizeErrorMessage(error)
+      setStatus(statusBox, message, 'warn')
+      const isAnswer = signal && signal.type === 'answer'
+      if (isTargetNotConnectedError(error) && shouldAutoJoin() && (isAnswer || !isPeerConnectionHealthy(nextPeer))) {
+        if (peer === nextPeer) {
+          destroyPeer()
+        }
+        scheduleReconnect('host temporarily disconnected', true)
+      }
     }
   })
 

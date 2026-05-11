@@ -141,6 +141,7 @@ function serveFile(res, filePath) {
 function createState() {
   return {
     serverRunning: true,
+    shuttingDown: false,
     broadcasterId: null,
     broadcasterSessionId: '',
     broadcasterSessionStartedAt: null,
@@ -159,6 +160,29 @@ function createState() {
       diagnosticsUpdates: 0
     }
   }
+}
+
+function shutdownProcess(server, state, reason) {
+  if (state.shuttingDown) return
+  state.shuttingDown = true
+  recordDebugEvent(state, 'server-control', {
+    action: 'shutdown',
+    changed: true,
+    running: state.serverRunning,
+    reason: reason || 'api-shutdown'
+  })
+
+  stopService(state, 'api-shutdown')
+
+  setTimeout(() => {
+    server.close(() => {
+      process.exit(0)
+    })
+
+    setTimeout(() => {
+      process.exit(0)
+    }, 2000)
+  }, 120)
 }
 
 function getDefaultSettings(role) {
@@ -696,15 +720,8 @@ function attachSse(state, req, res, parsedUrl) {
     }
   }, SSE_HEARTBEAT_MS)
 
-  if (client.role === 'listener' && state.broadcasterId) {
-    const broadcaster = state.clients.get(state.broadcasterId)
-    if (broadcaster && broadcaster.res) {
-      sendEvent(broadcaster, 'listener-joined', {
-        clientId,
-        reason: 'sse-reconnect'
-      })
-    }
-  }
+  // Do not emit listener-joined on SSE reconnect for an already-registered listener.
+  // Re-announcing a joined listener causes unnecessary renegotiation churn while audio is healthy.
 
   req.on('close', () => {
     clearInterval(heartbeatTimer)
@@ -1109,14 +1126,29 @@ async function handleClientDiagnostics(state, req, res) {
   sendJson(res, 200, { ok: true, diagnostics })
 }
 
-async function handleServerControl(state, req, res, activePort) {
+async function handleServerControl(server, state, req, res, activePort) {
   const body = await readBody(req)
   const action = typeof body.action === 'string'
     ? body.action.trim().toLowerCase()
     : ''
 
-  if (action !== 'start' && action !== 'stop') {
-    sendJson(res, 400, { error: 'Invalid action. Use start or stop.' })
+  if (action !== 'start' && action !== 'stop' && action !== 'shutdown') {
+    sendJson(res, 400, { error: 'Invalid action. Use start, stop, or shutdown.' })
+    return
+  }
+
+  if (action === 'shutdown') {
+    sendJson(res, 200, {
+      ok: true,
+      shuttingDown: true,
+      ...getStatusSnapshot(state, activePort)
+    })
+    shutdownProcess(server, state, 'api-shutdown')
+    return
+  }
+
+  if (state.shuttingDown) {
+    sendJson(res, 503, { error: 'Server is shutting down' })
     return
   }
 
@@ -1180,7 +1212,7 @@ function createServer() {
       }
 
       if (req.method === 'POST' && parsedUrl.pathname === '/api/server-control') {
-        await handleServerControl(state, req, res, activePort)
+        await handleServerControl(server, state, req, res, activePort)
         return
       }
 
@@ -1308,7 +1340,8 @@ function startServer() {
     if (error && error.code === 'EADDRINUSE') {
       console.error(`Port ${PORT} is already in use.`)
       console.error('Another Home Audio process is already running.')
-      console.error(`If http://localhost:${PORT}/host shows "Start server", start it there (do not launch another node instance).`)
+      console.error(`If http://localhost:${PORT}/host shows "resume relay", resume it there (do not launch another node instance).`)
+      console.error(`To fully stop that process, use the host page button "shutdown app".`)
       console.error(`Otherwise stop the existing process using port ${PORT}, or run with PORT=<new-port>.`)
       process.exit(1)
       return

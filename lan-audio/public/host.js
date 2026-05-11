@@ -4,6 +4,7 @@ const startButton = document.querySelector('#start')
 const stopButton = document.querySelector('#stop')
 const takeoverButton = document.querySelector('#takeover')
 const serverToggleButton = document.querySelector('#server-toggle')
+const serverShutdownButton = document.querySelector('#server-shutdown')
 const statusBox = document.querySelector('#status')
 const listenLinks = document.querySelector('#listen-links')
 const listenerCount = document.querySelector('#listener-count')
@@ -86,6 +87,7 @@ let hostConflict = null
 let monitorProcessor = null
 let participants = []
 let diagnosticsInterval = null
+let eventSourceReconnectTimer = null
 let remoteDiagnostics = {}
 let peerTransportStats = {}
 let lastPeerTraffic = {}
@@ -106,6 +108,28 @@ function normalizeErrorMessage(error) {
   if (typeof error === 'string') return error
   if (error.message) return String(error.message)
   return String(error)
+}
+
+function isTargetNotConnectedError(error) {
+  return /Target client is not connected/i.test(normalizeErrorMessage(error))
+}
+
+function isPeerConnectionHealthy(peerInstance) {
+  if (!peerInstance || peerInstance.destroyed) return false
+  const pc = peerInstance._pc
+  if (!pc) return false
+  const connectionState = String(pc.connectionState || '')
+  const iceConnectionState = String(pc.iceConnectionState || '')
+  const failedStates = ['failed', 'closed', 'disconnected']
+  if (failedStates.includes(connectionState) || failedStates.includes(iceConnectionState)) {
+    return false
+  }
+  return connectionState === 'connected' || connectionState === 'connecting' ||
+    iceConnectionState === 'connected' || iceConnectionState === 'completed' || iceConnectionState === 'checking'
+}
+
+function hasHealthyPeerForListener(listenerId) {
+  return isPeerConnectionHealthy(peers.get(listenerId))
 }
 
 function getPersistentHostId() {
@@ -175,6 +199,104 @@ function wait(ms) {
   return new Promise(resolve => {
     window.setTimeout(resolve, ms)
   })
+}
+
+async function streamHasSignal(stream, sampleMs) {
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext
+  if (!AudioContextCtor || !stream) return true
+
+  let context = null
+  let source = null
+  let analyser = null
+
+  try {
+    context = new AudioContextCtor()
+    source = context.createMediaStreamSource(stream)
+    analyser = context.createAnalyser()
+    analyser.fftSize = 2048
+    source.connect(analyser)
+
+    const data = new Float32Array(analyser.fftSize)
+    const checks = Math.max(6, Math.round((sampleMs || 1600) / 120))
+    let peak = 0
+
+    for (let index = 0; index < checks; index += 1) {
+      analyser.getFloatTimeDomainData(data)
+      let sumSquares = 0
+      for (let i = 0; i < data.length; i += 1) {
+        const sample = data[i]
+        const abs = Math.abs(sample)
+        if (abs > peak) peak = abs
+        sumSquares += sample * sample
+      }
+
+      const rms = Math.sqrt(sumSquares / data.length)
+      if (rms > 0.003 || peak > 0.02) {
+        return true
+      }
+
+      await wait(120)
+    }
+
+    return false
+  } catch (error) {
+    return true
+  } finally {
+    try {
+      if (source) source.disconnect()
+    } catch (error) {}
+    try {
+      if (analyser) analyser.disconnect()
+    } catch (error) {}
+    try {
+      if (context) await context.close()
+    } catch (error) {}
+  }
+}
+
+async function openCaptureStreamForDevice(deviceId) {
+  const audioConstraints = {
+    channelCount: 2,
+    sampleRate: 48000,
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false
+  }
+
+  if (deviceId) {
+    audioConstraints.deviceId = { exact: deviceId }
+  }
+
+  return navigator.mediaDevices.getUserMedia({
+    audio: audioConstraints,
+    video: false
+  })
+}
+
+function pickFallbackSourceIds(selectedDeviceId) {
+  const seen = new Set()
+  const ids = []
+  const push = value => {
+    const normalized = String(value || '')
+    if (!normalized || seen.has(normalized)) return
+    seen.add(normalized)
+    ids.push(normalized)
+  }
+
+  push(selectedDeviceId)
+
+  const options = Array.from(sourceDeviceSelect.options || [])
+  const cableOption = options.find(option => /cable output/i.test(option.textContent || ''))
+  if (cableOption) {
+    push(cableOption.value)
+  }
+
+  options.forEach(option => {
+    if (ids.length >= 3) return
+    push(option.value)
+  })
+
+  return ids
 }
 
 function loadEqStateStore() {
@@ -907,6 +1029,10 @@ function startDiagnostics() {
   if (diagnosticsInterval) return
   renderDiagnostics()
   diagnosticsInterval = window.setInterval(() => {
+    if (audioOnlyStream && !eventSource && !stopping) {
+      ensureEventSource()
+    }
+
     updatePeerStats()
       .catch(error => {
         console.debug('Host peer stats update failed:', error)
@@ -920,8 +1046,11 @@ function startDiagnostics() {
 
 function setServerToggleButtonState() {
   if (!serverToggleButton) return
-  serverToggleButton.textContent = serverRunning ? 'stop server' : 'start server'
+  serverToggleButton.textContent = serverRunning ? 'pause relay' : 'resume relay'
   serverToggleButton.disabled = serverControlBusy
+  if (serverShutdownButton) {
+    serverShutdownButton.disabled = serverControlBusy
+  }
 }
 
 function applyServerRunningState(nextState) {
@@ -1028,7 +1157,7 @@ function renderLinks(status) {
   if (!running) {
     const message = document.createElement('p')
     message.className = 'small'
-    message.textContent = 'Server stopped.'
+    message.textContent = 'Relay paused. Node process is still running.'
     listenLinks.appendChild(message)
     return
   }
@@ -1226,6 +1355,18 @@ function updateParticipants(nextParticipants) {
   renderEqDrawer()
   renderDiagnostics()
   renderRemoteDiagnostics()
+
+  if (audioOnlyStream && !stopping) {
+    participants
+      .filter(participant => participant && participant.role === 'listener' && participant.clientId)
+      .forEach(participant => {
+        if (!hasHealthyPeerForListener(participant.clientId)) {
+          createPeer(participant.clientId).catch(error => {
+            console.debug('Host peer reconcile failed:', error)
+          })
+        }
+      })
+  }
 }
 
 function resetEventSource() {
@@ -1234,6 +1375,26 @@ function resetEventSource() {
     eventSource.close()
   } catch (error) {}
   eventSource = null
+}
+
+function clearEventSourceReconnectTimer() {
+  if (!eventSourceReconnectTimer) return
+  window.clearTimeout(eventSourceReconnectTimer)
+  eventSourceReconnectTimer = null
+}
+
+function scheduleEventSourceReconnect(delayMs) {
+  if (eventSourceReconnectTimer) return
+  if (!audioOnlyStream || stopping) return
+
+  const delay = Math.max(0, Number(delayMs) || 0)
+  eventSourceReconnectTimer = window.setTimeout(() => {
+    eventSourceReconnectTimer = null
+    if (!audioOnlyStream || stopping) return
+    if (!eventSource) {
+      ensureEventSource()
+    }
+  }, delay)
 }
 
 async function handleHostRevoked(payload) {
@@ -1269,9 +1430,8 @@ function ensureEventSource(options) {
 
   nextEventSource.addEventListener('error', () => {
     if (eventSource !== nextEventSource) return
-    if (nextEventSource.readyState === EventSource.CLOSED) {
-      resetEventSource()
-    }
+    resetEventSource()
+    scheduleEventSourceReconnect(500)
   })
 
   nextEventSource.addEventListener('listener-joined', async event => {
@@ -1486,6 +1646,10 @@ async function createPeer(listenerId) {
       await postSignalWithRetry(hostId, listenerId, signal)
     } catch (error) {
       setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+      const isOffer = signal && signal.type === 'offer'
+      if (isTargetNotConnectedError(error) && (isOffer || !isPeerConnectionHealthy(peer))) {
+        destroyPeer(listenerId)
+      }
     }
   })
 
@@ -1540,17 +1704,38 @@ async function startBroadcast(options) {
     throw new Error('Select source.')
   }
 
-  captureStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      deviceId: { exact: sourceDeviceSelect.value },
-      channelCount: 2,
-      sampleRate: 48000,
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false
-    },
-    video: false
-  })
+  const candidateSourceIds = pickFallbackSourceIds(sourceDeviceSelect.value)
+  let selectedCaptureDeviceId = ''
+  let lastCaptureError = null
+
+  for (const candidateId of candidateSourceIds) {
+    try {
+      const candidateStream = await openCaptureStreamForDevice(candidateId)
+      const candidateAudioOnly = new MediaStream(candidateStream.getAudioTracks())
+      const hasSignal = await streamHasSignal(candidateAudioOnly, 1800)
+
+      if (!hasSignal) {
+        candidateStream.getTracks().forEach(track => track.stop())
+        lastCaptureError = new Error('Selected source is silent.')
+        continue
+      }
+
+      captureStream = candidateStream
+      selectedCaptureDeviceId = candidateId
+      break
+    } catch (error) {
+      lastCaptureError = error
+    }
+  }
+
+  if (!captureStream) {
+    throw lastCaptureError || new Error('Unable to capture audio from selected source.')
+  }
+
+  if (selectedCaptureDeviceId && sourceDeviceSelect.value !== selectedCaptureDeviceId) {
+    sourceDeviceSelect.value = selectedCaptureDeviceId
+    setStatus(statusBox, 'Switched source to active input signal.', 'warn')
+  }
 
   const audioTracks = captureStream.getAudioTracks()
   if (!audioTracks.length) {
@@ -1566,6 +1751,7 @@ async function startBroadcast(options) {
   const registration = await registerBroadcaster({ takeover })
 
   updateParticipants(registration.participants)
+  clearEventSourceReconnectTimer()
   ensureEventSource({ forceReset: true })
   clearHostConflict()
   await startLocalMonitor()
@@ -1624,6 +1810,7 @@ async function stopBroadcast(options) {
       console.error(error)
     }
   }
+  clearEventSourceReconnectTimer()
   resetEventSource()
 
   lastDiagnosticsText = ''
@@ -1767,13 +1954,42 @@ if (serverToggleButton) {
       const status = await postJson('/api/server-control', { action })
       renderLinks(status)
       await refreshHostSessionConflict()
-      setStatus(statusBox, status.serverRunning ? 'Server running.' : 'Server stopped.')
+      setStatus(
+        statusBox,
+        status.serverRunning
+          ? 'Relay resumed.'
+          : 'Relay paused (Node process still running on this port).'
+      )
     } catch (error) {
       setStatus(statusBox, normalizeErrorMessage(error), 'warn')
       try {
         await refreshStatusAndLinks()
       } catch (refreshError) {}
     } finally {
+      serverControlBusy = false
+      setServerToggleButtonState()
+    }
+  })
+}
+
+if (serverShutdownButton) {
+  serverShutdownButton.addEventListener('click', async () => {
+    if (serverControlBusy) return
+
+    const confirmed = window.confirm('Shutdown Home Audio app process? You will need to run npm run lan-audio again to start it.')
+    if (!confirmed) return
+
+    serverControlBusy = true
+    setServerToggleButtonState()
+
+    try {
+      await postJson('/api/server-control', { action: 'shutdown' })
+      setStatus(statusBox, 'Shutting down app process...')
+      applyServerRunningState(false)
+    } catch (error) {
+      setStatus(statusBox, normalizeErrorMessage(error), 'warn')
+    } finally {
+      // Process is expected to exit quickly; if not, allow retries.
       serverControlBusy = false
       setServerToggleButtonState()
     }
